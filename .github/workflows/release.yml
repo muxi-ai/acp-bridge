@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: muxi-acp
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Native arm64 runner (free for public repos) — avoids
+          # cross-compiling openssl-sys, which the MUXI SDK pulls in via
+          # native-tls.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    # NOTE on musl/static Linux builds: the MUXI Rust SDK currently links
+    # native-tls (system OpenSSL), so the *-linux-gnu binaries dynamically
+    # link libssl/libcrypto from the build runner's distro. Once the SDK
+    # supports rustls (or vendored OpenSSL), switch the Linux targets to
+    # *-unknown-linux-musl for fully static binaries.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        # --config strips symbols from the release binary on every platform
+        # without touching Cargo.toml.
+        run: cargo build --release --target ${{ matrix.target }} --config 'profile.release.strip="symbols"'
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          pkg="${BIN_NAME}-${version}-${{ matrix.target }}"
+          mkdir "$pkg"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" LICENSE README.md "$pkg/"
+          tar czf "$pkg.tar.gz" "$pkg"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $pkg = "$env:BIN_NAME-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe", LICENSE, README.md -Destination $pkg
+          Compress-Archive -Path $pkg -DestinationPath "$pkg.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      # SBOM generated from Cargo.lock via syft.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/${{ env.BIN_NAME }}-${{ github.ref_name }}.sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+
+      # TODO(signing): sign the archives and SHA256SUMS here (e.g. cosign
+      # keyless via sigstore/cosign-installer, or minisign) and attach the
+      # signatures/certificates to the release alongside the checksums.
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: dist/*
