@@ -107,11 +107,55 @@ fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D
     humantime::parse_duration(&raw).map_err(serde::de::Error::custom)
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Which ACP host's identity signal to extract (spec §5.2 tier 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityHost {
+    /// Parse Buzz's `[Buzz events …]` prompt block (see `buzz.rs`).
+    Buzz,
+    /// No host extraction: tiers 1/3/4 only.
+    #[default]
+    None,
+}
+
+/// What a Buzz-extracted id identifies (spec §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostUnit {
+    /// `<prefix>:channel:<uuid>` — memory follows the conversation. The
+    /// recommended default: the only unit well-defined when a batch mixes
+    /// senders, and in a DM the channel *is* the person.
+    #[default]
+    Channel,
+    /// `<prefix>:pubkey:<hex>` — memory follows the person across channels.
+    /// Under batching the turn is attributed to the LAST event's sender.
+    Sender,
+}
+
+/// `[profiles.X.identity]` (spec §2/§5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct Identity {
-    /// Used when no `--user-id` flag is given. Empty means unset.
-    #[serde(default)]
+    /// Enables tier-2 host extraction. `"none"` (default) disables it.
+    pub host: IdentityHost,
+    /// Buzz only: what the extracted id identifies.
+    pub host_unit: HostUnit,
+    /// Used when no `--user-id` flag is given and host extraction is
+    /// unavailable or fails. Empty means unset.
     pub default_user_id: Option<String>,
+    /// Namespaces extracted ids so hosts can never collide.
+    pub id_prefix: String,
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Self {
+            host: IdentityHost::default(),
+            host_unit: HostUnit::default(),
+            default_user_id: None,
+            id_prefix: "buzz".to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -286,15 +330,19 @@ fn is_loopback_host(url: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
-/// Identity resolution (binding spec §5.2, PoC subset):
-/// `--user-id` flag > `identity.default_user_id` > per-session `acp:<session_id>`.
-/// Host (Buzz) extraction is tier 2 and not implemented yet — see `buzz.rs`.
+/// Identity resolution (binding spec §5.2):
+/// `--user-id` flag > host extraction (tier 2, see `buzz.rs`) >
+/// `identity.default_user_id` > per-session `acp:<session_id>`.
 pub fn resolve_user_id(
     cli_user_id: Option<&str>,
+    host_extracted: Option<&str>,
     default_user_id: Option<&str>,
     acp_session_id: &str,
 ) -> String {
     if let Some(user_id) = cli_user_id.filter(|id| !id.is_empty()) {
+        return user_id.to_string();
+    }
+    if let Some(user_id) = host_extracted.filter(|id| !id.is_empty()) {
         return user_id.to_string();
     }
     if let Some(user_id) = default_user_id.filter(|id| !id.is_empty()) {
@@ -515,9 +563,73 @@ mod tests {
 
     #[test]
     fn user_id_precedence() {
-        assert_eq!(resolve_user_id(Some("ran"), Some("dflt"), "sess_1"), "ran");
-        assert_eq!(resolve_user_id(None, Some("dflt"), "sess_1"), "dflt");
-        assert_eq!(resolve_user_id(None, None, "sess_1"), "acp:sess_1");
-        assert_eq!(resolve_user_id(Some(""), Some(""), "sess_1"), "acp:sess_1");
+        // flag > host extraction > default_user_id > per-session synthetic
+        assert_eq!(
+            resolve_user_id(Some("ran"), Some("buzz:channel:x"), Some("dflt"), "sess_1"),
+            "ran"
+        );
+        assert_eq!(
+            resolve_user_id(None, Some("buzz:channel:x"), Some("dflt"), "sess_1"),
+            "buzz:channel:x"
+        );
+        assert_eq!(resolve_user_id(None, None, Some("dflt"), "sess_1"), "dflt");
+        assert_eq!(resolve_user_id(None, None, None, "sess_1"), "acp:sess_1");
+        assert_eq!(
+            resolve_user_id(Some(""), Some(""), Some(""), "sess_1"),
+            "acp:sess_1"
+        );
+    }
+
+    #[test]
+    fn identity_section_defaults_and_parse() {
+        let (_, prod) = select_profile(&sample(), Some("prod")).unwrap();
+        assert_eq!(prod.identity.host, IdentityHost::None);
+        assert_eq!(prod.identity.host_unit, HostUnit::Channel);
+        assert_eq!(prod.identity.id_prefix, "buzz");
+
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+            [profiles.p]
+            base_url = "https://x/v1"
+            client_key = "env:K"
+
+            [profiles.p.identity]
+            host = "buzz"
+            host_unit = "sender"
+            id_prefix = "nostr"
+            default_user_id = "shared"
+            "#,
+        )
+        .unwrap();
+        let (_, profile) = select_profile(&parsed, Some("p")).unwrap();
+        assert_eq!(profile.identity.host, IdentityHost::Buzz);
+        assert_eq!(profile.identity.host_unit, HostUnit::Sender);
+        assert_eq!(profile.identity.id_prefix, "nostr");
+        assert_eq!(profile.identity.default_user_id.as_deref(), Some("shared"));
+
+        // Typos in the identity table are rejected, not silently ignored.
+        assert!(toml::from_str::<ConfigFile>(
+            r#"
+            [profiles.p]
+            base_url = "https://x/v1"
+            client_key = "env:K"
+
+            [profiles.p.identity]
+            host_units = "sender"
+            "#,
+        )
+        .is_err());
+        // And so are unknown enum values.
+        assert!(toml::from_str::<ConfigFile>(
+            r#"
+            [profiles.p]
+            base_url = "https://x/v1"
+            client_key = "env:K"
+
+            [profiles.p.identity]
+            host = "slack"
+            "#,
+        )
+        .is_err());
     }
 }

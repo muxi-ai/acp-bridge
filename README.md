@@ -64,8 +64,20 @@ max_concurrent_turns = 4        # prompts beyond this -> BRIDGE_TURN_LIMIT (neve
 max_buffered_bytes   = 1048576  # per-turn cap on updates queued but unwritten
 
 [profiles.production.identity]
-# Used when no --user-id flag is given; if both are unset, each session
-# gets a synthetic partition id `acp:<session_id>`.
+# Tier-2 host identity extraction: "buzz" parses the Buzz events block out
+# of each turn's prompt text; "none" (default) disables extraction.
+host = "none"
+# Buzz only: what the extracted id identifies.
+#   "channel" (default) -> buzz:channel:<uuid>  (memory follows the conversation)
+#   "sender"            -> buzz:pubkey:<hex>    (memory follows the person;
+#                          batches with mixed senders attribute to the LAST
+#                          event's sender and log a stderr diagnostic)
+host_unit = "channel"
+# Namespaces extracted ids so hosts can never collide.
+id_prefix = "buzz"
+# Fallback when no --user-id flag is given and extraction is unavailable or
+# fails; if everything is unset, each session gets a synthetic partition id
+# `acp:<session_id>`.
 default_user_id = ""
 ```
 
@@ -101,7 +113,9 @@ cargo test --test e2e -- --nocapture
 Fixtures cover: content deltas → ui → done, an upstream error event, a
 stream that dies mid-turn, a hanging stream interrupted by
 `session/cancel`, idle/turn timeouts, a firehose that overflows the
-northbound buffer cap, and stdin EOF cancelling an in-flight turn.
+northbound buffer cap, stdin EOF cancelling an in-flight turn, and a
+Buzz-shaped prompt whose extracted channel identity must reach the server
+as `X-Muxi-User-ID`.
 
 ## CLI
 
@@ -112,8 +126,9 @@ northbound buffer cap, and stdin EOF cancelling an in-flight turn.
 | `--user-id <id>` | Pin every session to this MUXI memory partition |
 | `--forward-thoughts` | Forward `thinking` events as `agent_thought_chunk` |
 
-Identity precedence: `--user-id` → `identity.default_user_id` →
-per-session synthetic `acp:<session_id>`.
+Identity precedence: `--user-id` → host extraction (`identity.host`, per
+turn from the prompt text) → `identity.default_user_id` → per-session
+synthetic `acp:<session_id>`.
 
 ## Status
 
@@ -132,7 +147,7 @@ per-session synthetic `acp:<session_id>`.
 | TLS enforcement | ✅ plaintext (`http://` / `ws://`) endpoints rejected at startup unless loopback + `allow_insecure_localhost = true`; error names the offending profile key |
 | Graceful shutdown | ✅ stdin EOF or SIGTERM/SIGINT: stop accepting requests, cancel all active MUXI turns (bounded 5s window), flush stdout, exit 0 |
 | Session persistence | ❌ in-memory only; dies with the process. `session/resume` still works across restarts because the bridge owns the id space, but MUXI-side context depends on the formation's buffer. |
-| Buzz identity extraction (`_meta` / prompt-text parsing) | ❌ stub only (`src/buzz.rs`); tiers 1/3/4 of identity resolution work today |
+| Buzz identity extraction | ✅ prompt-text parser (`src/buzz.rs`): `channel` (default) / `sender` units, strict validation, soft-fail to `default_user_id` / per-session id, multi-sender + header-count diagnostics. `_meta`-based extraction stays pending the upstream `buzz-acp` proposal |
 | `keychain:` secret references | ❌ stub — returns "not yet implemented"; use `env:` or `file:` |
 | `session/load` (history replay) | ❌ deliberately not advertised (MUXI's history endpoint can't honor it honestly) |
 | UI widgets → `elicitation` | ❌ v2 idea; the text stream always carries the fallback |

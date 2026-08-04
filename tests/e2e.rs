@@ -32,6 +32,7 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 struct ServerState {
     cancelled_request_ids: Mutex<Vec<String>>,
     seen_client_keys: Mutex<Vec<String>>,
+    seen_user_ids: Mutex<Vec<String>>,
     chat_payloads: Mutex<Vec<Value>>,
 }
 
@@ -80,6 +81,16 @@ async fn chat_handler(
         .and_then(|value| value.to_str().ok())
     {
         state.seen_client_keys.lock().unwrap().push(key.to_string());
+    }
+    if let Some(user_id) = headers
+        .get("x-muxi-user-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        state
+            .seen_user_ids
+            .lock()
+            .unwrap()
+            .push(user_id.to_string());
     }
 
     let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
@@ -174,6 +185,12 @@ async fn chat_handler(
                 )],
             )
         }
+        // A Buzz-shaped prompt (identity extraction test): reply and finish.
+        buzz if buzz.contains("[Buzz event") => sse_response(vec![
+            data_frame(stamp(json!({"type": "content", "content": "ack"}))),
+            data_frame(stamp(json!({"type": "completed"}))),
+            format!("event: done\ndata: {}\n\n", json!({"finished": true})),
+        ]),
         other => panic!("fake server: unknown scenario '{other}'"),
     }
 }
@@ -727,6 +744,84 @@ max_buffered_bytes = 4096
         response["error"]["data"]["code"], "BRIDGE_BUFFER_OVERFLOW",
         "response: {response}"
     );
+}
+
+/// Buzz identity extraction (spec §5): with `identity.host = "buzz"` in
+/// channel mode, a Buzz-shaped prompt must reach MUXI with
+/// `X-Muxi-User-ID: buzz:channel:<uuid>` — and a non-Buzz prompt on the same
+/// profile must fall through to the per-session synthetic id, never a
+/// fabricated one.
+#[tokio::test]
+async fn buzz_channel_identity_reaches_upstream() {
+    let (addr, server) = start_fake_server().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut acp = AcpChild::spawn_with_config(
+        addr,
+        config_dir.path(),
+        r#"
+[profiles.test.identity]
+host = "buzz"
+host_unit = "channel"
+"#,
+    )
+    .await;
+    let session_id = establish_session(&mut acp).await;
+
+    let uuid = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+    let alice = "a".repeat(64);
+    let bob = "b".repeat(64);
+    let prompt = format!(
+        "[Buzz events — 2 events]\n\n\
+         --- Event 1 (mention) ---\n\
+         Event ID: deadbeef\n\
+         Channel: eng-oncall (#{uuid})\n\
+         Kind: 9\n\
+         From: alice (npub: npub1alice, hex: {alice})\n\
+         Content: the deploy is stuck\n\n\
+         --- Event 2 (message) ---\n\
+         Event ID: cafebabe\n\
+         Channel: eng-oncall (#{uuid})\n\
+         Kind: 9\n\
+         From: bob (npub: npub1bob, hex: {bob})\n\
+         Content: same here\n"
+    );
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}]
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+    {
+        let user_ids = server.seen_user_ids.lock().unwrap();
+        assert_eq!(
+            user_ids.as_slice(),
+            [format!("buzz:channel:{uuid}")],
+            "extracted identity did not reach the fake server"
+        );
+    }
+
+    // Parse-miss fallback: a prompt without a Buzz block falls through to the
+    // per-session synthetic id (no default_user_id configured).
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "happy"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    {
+        let user_ids = server.seen_user_ids.lock().unwrap();
+        assert_eq!(user_ids.len(), 2);
+        assert_eq!(user_ids[1], format!("acp:{session_id}"));
+    }
 }
 
 /// Closing the bridge's stdin mid-turn (host went away) must cancel the MUXI
