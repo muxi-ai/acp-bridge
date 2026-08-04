@@ -267,9 +267,9 @@ impl SessionRegistry {
 /// Mint an id like `sess_h1x9k2p4q7z3` / `req_...`.
 pub fn new_id(prefix: &str) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let suffix: String = (0..12)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect();
     format!("{prefix}_{suffix}")
 }
