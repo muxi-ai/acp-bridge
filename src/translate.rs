@@ -129,15 +129,28 @@ impl Translator {
             // No general ACP progress channel; never fabricate content (§7).
             "progress" => Vec::new(),
             "completed" => {
-                // The runtime does not stream `content` deltas for a plain
-                // turn: the full assistant text arrives HERE, in the terminal
-                // event's `content` field (verified against a live formation).
-                // Emit it as the final message chunk — unless deltas were
-                // already streamed, in which case it duplicates what the host
-                // has seen (PRD §15.2 dedup rule).
+                // The runtime may stream the reply as `content` deltas (token
+                // streaming, runtime >= #317) or deliver it only HERE, in the
+                // terminal event's `content` field. Emit terminal text as the
+                // final message chunk unless deltas already carried it (PRD
+                // §15.2 dedup rule) — EXCEPT when the runtime flags
+                // `stream_discontinuity`: the provider failed mid-stream and
+                // the published deltas belong to an abandoned generation, so
+                // the terminal text is authoritative and must be emitted even
+                // though deltas were seen (prefixed with a paragraph break so
+                // hosts render it as a fresh block after the partial text).
                 let text = event_text(&obj);
-                if !self.streamed_content && !text.is_empty() {
-                    let mut out = message_chunk(&text);
+                let discontinuity = obj
+                    .get("stream_discontinuity")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !text.is_empty() && (!self.streamed_content || discontinuity) {
+                    let chunk_text = if discontinuity && self.streamed_content {
+                        format!("\n\n{text}")
+                    } else {
+                        text
+                    };
+                    let mut out = message_chunk(&chunk_text);
                     out.push(TurnEvent::Completed);
                     out
                 } else {
@@ -425,6 +438,36 @@ mod tests {
             other => panic!("expected message chunk, got {other:?}"),
         }
         assert_eq!(out[1], TurnEvent::Completed);
+    }
+
+    #[test]
+    fn discontinuity_overrides_dedup_with_paragraph_break() {
+        // Provider failed mid-stream: deltas belong to an abandoned
+        // generation, so the flagged terminal text must be emitted.
+        let mut t = Translator::new(false);
+        t.translate(&frame(r#"{"type":"content","content":"partial gar"}"#));
+        let out = t.translate(&frame(
+            r#"{"type":"completed","content":"Full answer.","stream_discontinuity":true}"#,
+        ));
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            TurnEvent::Update(update) => assert_eq!(text_of(update), "\n\nFull answer."),
+            other => panic!("expected message chunk, got {other:?}"),
+        }
+        assert_eq!(out[1], TurnEvent::Completed);
+    }
+
+    #[test]
+    fn discontinuity_without_prior_deltas_needs_no_break() {
+        let mut t = Translator::new(false);
+        let out = t.translate(&frame(
+            r#"{"type":"completed","content":"Full answer.","stream_discontinuity":true}"#,
+        ));
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            TurnEvent::Update(update) => assert_eq!(text_of(update), "Full answer."),
+            other => panic!("expected message chunk, got {other:?}"),
+        }
     }
 
     #[test]
