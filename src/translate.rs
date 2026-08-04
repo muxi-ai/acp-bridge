@@ -18,6 +18,17 @@ pub const CODE_STREAM_TRUNCATED: &str = "BRIDGE_STREAM_TRUNCATED";
 pub const CODE_UPSTREAM_ERROR: &str = "BRIDGE_UPSTREAM_ERROR";
 /// Stable diagnostic code: the HTTPS/SSE transport failed mid-turn.
 pub const CODE_TRANSPORT_ERROR: &str = "BRIDGE_TRANSPORT_ERROR";
+/// Stable diagnostic code: the turn exceeded the profile's `turn_timeout`.
+pub const CODE_TURN_TIMEOUT: &str = "BRIDGE_TURN_TIMEOUT";
+/// Stable diagnostic code: no SSE frame arrived within `idle_timeout`.
+pub const CODE_IDLE_TIMEOUT: &str = "BRIDGE_IDLE_TIMEOUT";
+/// Stable diagnostic code: the turn's queued-but-unwritten `session/update`
+/// bytes exceeded `limits.max_buffered_bytes` (PRD §15.3).
+pub const CODE_BUFFER_OVERFLOW: &str = "BRIDGE_BUFFER_OVERFLOW";
+/// Stable diagnostic code: `session/new` rejected — `limits.max_sessions`.
+pub const CODE_SESSION_LIMIT: &str = "BRIDGE_SESSION_LIMIT";
+/// Stable diagnostic code: `session/prompt` rejected — `limits.max_concurrent_turns`.
+pub const CODE_TURN_LIMIT: &str = "BRIDGE_TURN_LIMIT";
 
 /// What a single MUXI SSE frame means for the current ACP turn.
 // `Update` dominates the enum size, but values are translated and consumed

@@ -14,17 +14,21 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
-    on_receive_notification, on_receive_request, Agent, Client, ConnectionTo, Responder, Stdio,
+    on_receive_notification, on_receive_request, Agent, Client, ConnectionTo, LineDirection,
+    Responder, Stdio,
 };
 use futures::StreamExt;
 use muxi_rust::FormationClient;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::resolve_user_id;
 use crate::mux::chat_payload;
-use crate::session::{new_id, ActiveTurn, SessionRegistry, TurnError};
-use crate::translate::{stream_end_outcome, Translator, TurnEvent, CODE_TRANSPORT_ERROR};
+use crate::session::{new_id, SessionRegistry, TurnError};
+use crate::translate::{
+    stream_end_outcome, Translator, TurnEvent, CODE_BUFFER_OVERFLOW, CODE_IDLE_TIMEOUT,
+    CODE_SESSION_LIMIT, CODE_TRANSPORT_ERROR, CODE_TURN_LIMIT, CODE_TURN_TIMEOUT,
+};
 
 /// Shared bridge state, cloned into every handler.
 pub struct BridgeState {
@@ -34,10 +38,15 @@ pub struct BridgeState {
     pub cli_user_id: Option<String>,
     pub default_user_id: Option<String>,
     pub forward_thoughts: bool,
+    /// Wall-clock cap for a whole prompt turn.
+    pub turn_timeout: std::time::Duration,
+    /// Cap on time between SSE frames (keepalive comments never surface from
+    /// the SDK parser, so this is simply time since the last event).
+    pub idle_timeout: std::time::Duration,
 }
 
 impl BridgeState {
-    fn user_id_for(&self, acp_session_id: &str) -> String {
+    pub(crate) fn user_id_for(&self, acp_session_id: &str) -> String {
         resolve_user_id(
             self.cli_user_id.as_deref(),
             self.default_user_id.as_deref(),
@@ -72,16 +81,17 @@ fn spawn_mux_cancel(
     cx: &ConnectionTo<Client>,
     state: &Arc<BridgeState>,
     session_id: &str,
-    turn: ActiveTurn,
+    request_id: &str,
 ) {
     let mux = state.mux.clone();
     let user_id = state.user_id_for(session_id);
     let session_id = session_id.to_string();
+    let request_id = request_id.to_string();
     let result = cx.spawn(async move {
-        if let Err(err) = mux.cancel_request(&turn.request_id, &user_id).await {
+        if let Err(err) = mux.cancel_request(&request_id, &user_id).await {
             tracing::debug!(
                 session_id,
-                request_id = turn.request_id,
+                request_id,
                 error = %err,
                 "MUXI cancel_request reported an error (expected: cancel returns 400 on success)"
             );
@@ -90,6 +100,26 @@ fn spawn_mux_cancel(
     });
     if let Err(err) = result {
         tracing::warn!(error = ?err, "failed to spawn MUXI cancel task");
+    }
+}
+
+/// stdout-writer hook (`Stdio::with_debug`): invoked for each line as the
+/// writer dequeues it. `session/update` lines complete one buffer reservation
+/// for their session — the send path reserved the bytes, so queued-but-unwritten
+/// is exactly (reserved - written). See `SessionRegistry::buffer_reserve`.
+fn note_line_written(sessions: &SessionRegistry, line: &str) {
+    // Cheap pre-filter: skip request/response frames without parsing.
+    if !line.contains("\"session/update\"") {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    if value.get("method").and_then(Value::as_str) != Some("session/update") {
+        return;
+    }
+    if let Some(session_id) = value.pointer("/params/sessionId").and_then(Value::as_str) {
+        sessions.buffer_written(session_id);
     }
 }
 
@@ -126,9 +156,19 @@ pub async fn run(state: Arc<BridgeState>) -> Result<(), Error> {
             async move |request: NewSessionRequest,
                         responder: Responder<NewSessionResponse>,
                         _cx| {
-                let session_id = st_new.sessions.create(request.cwd.clone());
-                tracing::info!(session_id, cwd = %request.cwd.display(), "session/new");
-                responder.respond(NewSessionResponse::new(session_id))
+                match st_new.sessions.create(request.cwd.clone()) {
+                    Ok(session_id) => {
+                        tracing::info!(session_id, cwd = %request.cwd.display(), "session/new");
+                        responder.respond(NewSessionResponse::new(session_id))
+                    }
+                    Err(_) => {
+                        tracing::warn!("session/new rejected: max_sessions reached");
+                        responder.respond_with_error(Error::invalid_params().data(json!({
+                            "code": CODE_SESSION_LIMIT,
+                            "message": "session limit reached (limits.max_sessions); close a session first",
+                        })))
+                    }
+                }
             },
             on_receive_request!(),
         )
@@ -143,7 +183,7 @@ pub async fn run(state: Arc<BridgeState>) -> Result<(), Error> {
                 let session_id = notification.session_id.0.to_string();
                 tracing::info!(session_id, "session/cancel");
                 if let Some(turn) = st_cancel.sessions.cancel_active_turn(&session_id) {
-                    spawn_mux_cancel(&cx, &st_cancel, &session_id, turn);
+                    spawn_mux_cancel(&cx, &st_cancel, &session_id, &turn.request_id);
                 }
                 Ok(())
             },
@@ -154,9 +194,19 @@ pub async fn run(state: Arc<BridgeState>) -> Result<(), Error> {
                         responder: Responder<ResumeSessionResponse>,
                         _cx| {
                 let session_id = request.session_id.0.to_string();
-                st_resume.sessions.resume(&session_id, request.cwd.clone());
-                tracing::info!(session_id, "session/resume (local rebind)");
-                responder.respond(ResumeSessionResponse::new())
+                match st_resume.sessions.resume(&session_id, request.cwd.clone()) {
+                    Ok(()) => {
+                        tracing::info!(session_id, "session/resume (local rebind)");
+                        responder.respond(ResumeSessionResponse::new())
+                    }
+                    Err(_) => {
+                        tracing::warn!(session_id, "session/resume rejected: max_sessions reached");
+                        responder.respond_with_error(Error::invalid_params().data(json!({
+                            "code": CODE_SESSION_LIMIT,
+                            "message": "session limit reached (limits.max_sessions); close a session first",
+                        })))
+                    }
+                }
             },
             on_receive_request!(),
         )
@@ -181,7 +231,7 @@ pub async fn run(state: Arc<BridgeState>) -> Result<(), Error> {
                 let session_id = request.session_id.0.to_string();
                 tracing::info!(session_id, "session/close");
                 if let Some(turn) = st_close.sessions.remove(&session_id) {
-                    spawn_mux_cancel(&cx, &st_close, &session_id, turn);
+                    spawn_mux_cancel(&cx, &st_close, &session_id, &turn.request_id);
                 }
                 responder.respond(CloseSessionResponse::new())
             },
@@ -194,13 +244,23 @@ pub async fn run(state: Arc<BridgeState>) -> Result<(), Error> {
                 let session_id = request.session_id.0.to_string();
                 tracing::info!(session_id, "session/delete (local only)");
                 if let Some(turn) = st_delete.sessions.remove(&session_id) {
-                    spawn_mux_cancel(&cx, &st_delete, &session_id, turn);
+                    spawn_mux_cancel(&cx, &st_delete, &session_id, &turn.request_id);
                 }
                 responder.respond(DeleteSessionResponse::new())
             },
             on_receive_request!(),
         )
-        .connect_to(Stdio::new())
+        .connect_to(Stdio::new().with_debug({
+            // Not for debugging: this is the write-completion signal for the
+            // per-turn buffer cap. The callback fires as each line reaches the
+            // stdout writer, i.e. when it leaves the outgoing queue.
+            let state = state.clone();
+            move |line: &str, direction: LineDirection| {
+                if direction == LineDirection::Stdout {
+                    note_line_written(&state.sessions, line);
+                }
+            }
+        }))
         .await
 }
 
@@ -246,6 +306,16 @@ fn handle_prompt(
                 "message": "a prompt is already running for this session",
             })));
         }
+        Err(TurnError::TurnLimit) => {
+            // Reject, never queue: the ACP host owns queuing and pacing (Buzz
+            // already keeps a per-channel prompt queue and will re-submit).
+            // A bridge-side queue would double-buffer prompts and hide the
+            // real saturation point from the host (spec §2 limits).
+            return responder.respond_with_error(Error::invalid_params().data(json!({
+                "code": CODE_TURN_LIMIT,
+                "message": "too many turns in flight (limits.max_concurrent_turns); retry after one finishes",
+            })));
+        }
         Err(TurnError::UnknownSession) => {
             return responder.respond_with_error(Error::invalid_params().data(json!({
                 "code": "BRIDGE_UNKNOWN_SESSION",
@@ -282,6 +352,15 @@ fn content_block_kind(block: &ContentBlock) -> &'static str {
 
 /// One prompt turn: chat_stream -> translate -> session/update notifications,
 /// resolved with exactly one terminal result. Never retries (spec §6).
+///
+/// Reliability posture (spec §6, PRD §15.3/§26):
+/// - `turn_timeout` bounds the whole turn; `idle_timeout` bounds the gap
+///   between SSE frames. Either expiry cancels upstream and fails the turn.
+/// - `limits.max_buffered_bytes` bounds updates queued northbound but not yet
+///   written; overflow cancels upstream and fails the turn — an update is
+///   never dropped while the turn reports success.
+/// - A host disconnect (stdin EOF) abandons the turn without responding; the
+///   shutdown path in `main` fires the upstream cancels.
 async fn run_turn(
     state: Arc<BridgeState>,
     cx: ConnectionTo<Client>,
@@ -301,6 +380,12 @@ async fn run_turn(
 
     let mut responder = Some(responder);
     let mut saw_terminal = false;
+    // When the host is gone there is no one to respond to: leave the turn in
+    // the registry so the shutdown path can cancel it upstream.
+    let mut leave_turn_registered = false;
+
+    let turn_deadline = tokio::time::Instant::now() + state.turn_timeout;
+    let mut idle_deadline = tokio::time::Instant::now() + state.idle_timeout;
 
     'turn: loop {
         tokio::select! {
@@ -312,6 +397,42 @@ async fn run_turn(
                 tracing::info!(session_id, request_id, "turn cancelled");
                 if let Some(responder) = responder.take() {
                     finish(responder.respond(PromptResponse::new(StopReason::Cancelled)));
+                }
+                break 'turn;
+            }
+            () = cx.incoming_closed() => {
+                // Host disconnected mid-turn (stdin EOF). Stop streaming so
+                // the connection can wind down; `main`'s shutdown path fires
+                // the MUXI-side cancel for every turn still registered.
+                tracing::info!(session_id, request_id, "host disconnected mid-turn");
+                leave_turn_registered = true;
+                break 'turn;
+            }
+            () = tokio::time::sleep_until(turn_deadline) => {
+                tracing::warn!(session_id, request_id, "turn timeout expired");
+                spawn_mux_cancel(&cx, &state, &session_id, &request_id);
+                if let Some(responder) = responder.take() {
+                    finish(responder.respond_with_error(bridge_error(
+                        CODE_TURN_TIMEOUT,
+                        &format!(
+                            "turn exceeded turn_timeout ({})",
+                            humantime::format_duration(state.turn_timeout)
+                        ),
+                    )));
+                }
+                break 'turn;
+            }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                tracing::warn!(session_id, request_id, "idle timeout expired");
+                spawn_mux_cancel(&cx, &state, &session_id, &request_id);
+                if let Some(responder) = responder.take() {
+                    finish(responder.respond_with_error(bridge_error(
+                        CODE_IDLE_TIMEOUT,
+                        &format!(
+                            "no upstream event within idle_timeout ({})",
+                            humantime::format_duration(state.idle_timeout)
+                        ),
+                    )));
                 }
                 break 'turn;
             }
@@ -338,11 +459,42 @@ async fn run_turn(
                     break 'turn;
                 }
                 Some(Ok(event)) => {
+                    idle_deadline = tokio::time::Instant::now() + state.idle_timeout;
                     for turn_event in translator.translate(&event) {
                         match turn_event {
                             TurnEvent::Update(update) => {
                                 let notification =
                                     SessionNotification::new(session_id.clone(), update);
+                                // Reserve the (approximate: params-only) wire
+                                // bytes against the per-turn cap before
+                                // queueing; the stdout-writer hook releases
+                                // the reservation once the line is written.
+                                let bytes = serde_json::to_string(&notification)
+                                    .map(|s| s.len())
+                                    .unwrap_or(0);
+                                if let Err(overflow) =
+                                    state.sessions.buffer_reserve(&session_id, bytes)
+                                {
+                                    tracing::warn!(
+                                        session_id,
+                                        request_id,
+                                        buffered = overflow.buffered_bytes,
+                                        limit = overflow.limit,
+                                        "per-turn buffer cap exceeded; failing the turn"
+                                    );
+                                    spawn_mux_cancel(&cx, &state, &session_id, &request_id);
+                                    if let Some(responder) = responder.take() {
+                                        finish(responder.respond_with_error(bridge_error(
+                                            CODE_BUFFER_OVERFLOW,
+                                            &format!(
+                                                "host is not draining session/update fast enough \
+                                                 ({} bytes queued > limits.max_buffered_bytes = {})",
+                                                overflow.buffered_bytes, overflow.limit
+                                            ),
+                                        )));
+                                    }
+                                    break 'turn;
+                                }
                                 if let Err(err) = cx.send_notification(notification) {
                                     // Connection is going away; nothing more to do.
                                     tracing::warn!(error = ?err, "failed to send session/update");
@@ -370,7 +522,9 @@ async fn run_turn(
         }
     }
 
-    state.sessions.end_turn(&session_id, &request_id);
+    if !leave_turn_registered {
+        state.sessions.end_turn(&session_id, &request_id);
+    }
     // Never propagate errors out of a spawned task: that would tear down the
     // whole connection over a single failed turn.
     Ok(())
