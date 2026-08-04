@@ -1,11 +1,14 @@
 //! muxi-acp: presents a remote MUXI formation as an ACP agent over stdio.
 //!
 //! Hard rule: stdout carries ACP JSON-RPC frames only. All logging goes to
-//! stderr via `tracing`.
+//! stderr via `tracing`. (This rule applies to ACP/connect mode — the default
+//! when no subcommand is given. Plain CLI subcommands such as `doctor` never
+//! speak ACP and print their reports to stdout; see `doctor.rs`.)
 
 mod agent;
 mod buzz;
 mod config;
+mod doctor;
 mod mux;
 mod session;
 mod translate;
@@ -14,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -24,21 +27,37 @@ use clap::Parser;
 )]
 struct Cli {
     /// Path to the TOML config file (default: platform config dir).
-    #[arg(long, env = "MUXI_ACP_CONFIG")]
+    #[arg(long, env = "MUXI_ACP_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// Named profile to use (default: `default_profile` from the config).
-    #[arg(long, env = "MUXI_ACP_PROFILE")]
+    #[arg(long, env = "MUXI_ACP_PROFILE", global = true)]
     profile: Option<String>,
 
     /// Pin every session to this MUXI user id (memory partition).
     /// Overrides the profile's `identity.default_user_id`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     user_id: Option<String>,
 
     /// Forward `thinking` events as agent_thought_chunk (overrides config).
     #[arg(long)]
     forward_thoughts: bool,
+
+    /// No subcommand = ACP/connect mode on stdio.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Validate production dependencies (config, TLS policy, DNS, TCP+TLS,
+    /// auth, streaming transport, cancellation, identity) without creating a
+    /// billable model turn. Exit 0 when nothing failed (warnings allowed).
+    Doctor {
+        /// Emit a machine-readable JSON array instead of the human report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Bound on the MUXI-side cancel sweep during shutdown (best-effort).
@@ -61,6 +80,17 @@ async fn main() -> ExitCode {
         .config
         .clone()
         .unwrap_or_else(config::default_config_path);
+
+    if let Some(Command::Doctor { json }) = &cli.command {
+        return doctor::run(
+            &config_path,
+            cli.profile.as_deref(),
+            cli.user_id.as_deref(),
+            *json,
+        )
+        .await;
+    }
+
     let state = match build_state(&cli, &config_path) {
         Ok(state) => state,
         Err(message) => {
