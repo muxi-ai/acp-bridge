@@ -2,8 +2,10 @@
 
 [![CI](https://github.com/muxi-ai/acp-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/muxi-ai/acp-bridge/actions/workflows/ci.yml)
 
-> **Status: WIP** — proof of concept. Nothing here is stable, supported, or
-> safe to depend on yet.
+> **Status: alpha** ([`v0.1.0-alpha`](https://github.com/muxi-ai/acp-bridge/releases)) —
+> feature-complete and hardened, verified against a live formation and a fake
+> ACP host, but not yet proven in a production Buzz deployment. Interfaces may
+> still change.
 
 A small standalone bridge that presents a remote [MUXI](https://muxi.ai)
 formation as an [Agent Client Protocol](https://agentclientprotocol.com)
@@ -14,6 +16,11 @@ runs locally except the translation.
 ```text
 ACP host ── ACP/JSON-RPC over stdio ──> muxi-acp ── HTTPS + SSE ──> MUXI formation
 ```
+
+Prebuilt binaries for macOS (arm64/x86_64), Linux (x86_64/arm64), and
+Windows — with checksums and an SBOM — are attached to each
+[GitHub release](https://github.com/muxi-ai/acp-bridge/releases); or
+`cargo build --release`. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 Design notes live in the MUXI engineering docs (binding spec: SDK choice,
 config format, ACP↔MUXI method/event mappings, identity resolution).
@@ -197,7 +204,7 @@ synthetic `acp:<session_id>`.
 | `session/new` / `session/prompt` / streaming | ✅ SSE → `session/update`, exactly one terminal per turn |
 | `session/cancel` | ✅ fires MUXI `cancel_request` + drops the stream; resolves `cancelled` unless a terminal won the race |
 | `session/resume` / `list` / `close` / `delete` | ✅ local registry only (resume = cheap rebind, by design — MUXI has no conversation resource) |
-| Event mapping | ✅ content / planning / replanning / tool_call (first-sighting) / completed / done; `thinking` gated behind `forward_thoughts`; `progress` and `ui` dropped in v1 |
+| Event mapping | ✅ content / planning / replanning / tool_call (first-sighting) / completed / done; `thinking` gated behind `forward_thoughts`; `progress` and `ui` dropped in v1. Token streaming (runtime ≥ #317) and terminal-only text both handled, with dedup; a `stream_discontinuity` flag on `completed` (provider failed mid-stream, fallback regenerated) makes the terminal text authoritative |
 | Stop reasons | ✅ `end_turn` / `cancelled` only; failures are JSON-RPC errors with stable `data.code` diagnostics — `MaxTokens`/`MaxTurnRequests`/`Refusal` are never emitted |
 | Retries | ✅ never for prompts (deliberate: a retried prompt re-runs the whole turn server-side) |
 | Turn / idle timeouts | ✅ `turn_timeout` (30m) bounds the whole turn, `idle_timeout` (10m) bounds silence between SSE frames; expiry cancels upstream and fails the turn (`BRIDGE_TURN_TIMEOUT` / `BRIDGE_IDLE_TIMEOUT`) |
@@ -206,11 +213,11 @@ synthetic `acp:<session_id>`.
 | TLS enforcement | ✅ plaintext (`http://` / `ws://`) endpoints rejected at startup unless loopback + `allow_insecure_localhost = true`; error names the offending profile key |
 | Graceful shutdown | ✅ stdin EOF or SIGTERM/SIGINT: stop accepting requests, cancel all active MUXI turns (bounded 5s window), flush stdout, exit 0 |
 | Session persistence | ❌ in-memory only; dies with the process. `session/resume` still works across restarts because the bridge owns the id space, but MUXI-side context depends on the formation's buffer. |
-| Buzz identity extraction | ✅ prompt-text parser (`src/buzz.rs`): `channel` (default) / `sender` units, strict validation, soft-fail to `default_user_id` / per-session id, multi-sender + header-count diagnostics. `_meta`-based extraction stays pending the upstream `buzz-acp` proposal |
+| Buzz identity extraction | ✅ prompt-text parser (`src/buzz.rs`): `channel` (default) / `sender` units, strict validation, soft-fail to `default_user_id` / per-session id, multi-sender + header-count diagnostics. `_meta`-based extraction pending upstream: [block/buzz#4745](https://github.com/block/buzz/issues/4745) (proposal) + [block/buzz#4751](https://github.com/block/buzz/pull/4751) (working PR) |
 | `keychain:` secret references | ✅ `keychain:<service>/<account>` via the `keyring` crate: macOS Keychain, Windows Credential Manager, Linux Secret Service (pure-Rust zbus D-Bus client — no OpenSSL, needs GNOME Keyring / KWallet running). Errors distinguish "entry not found" from "access denied / store unavailable" and never echo the value |
 | `session/load` (history replay) | ❌ deliberately not advertised (MUXI's history endpoint can't honor it honestly) |
 | UI widgets → `elicitation` | ❌ v2 idea; the text stream always carries the fallback |
-| Static builds / rustls | ❌ `muxi-rust`'s reqwest default features pull native-tls (OpenSSL/Security.framework), which blocks a fully static binary; the planned fix is a small SDK PR switching to `rustls-tls` |
+| Static builds / rustls | ⏳ the SDK-side fix is merged ([muxi-rust#4](https://github.com/muxi-ai/muxi-rust/pull/4): rustls with native + webpki roots, OpenSSL fully removed) and lands here as soon as `muxi-rust 1.20260804.0` is published to crates.io; until then Linux release binaries dynamically link the build runner's libssl |
 
 ## Development
 
