@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::routing::{delete, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -182,6 +182,17 @@ async fn cancel_handler(
     State(state): State<Arc<ServerState>>,
     Path(request_id): Path<String>,
 ) -> Response {
+    // Post-#314/#315 runtime behavior: an unknown request id gets a 404.
+    // The `doctor` cancellation probe relies on exactly this.
+    if request_id.starts_with("doctor-probe") {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"error": "request not found", "code": "REQUEST_NOT_FOUND"}).to_string(),
+            ))
+            .unwrap();
+    }
     state.cancelled_request_ids.lock().unwrap().push(request_id);
     // Mirror the known runtime defect: cancel returns 400 on success (§6).
     // The bridge must treat this as diagnostic-only.
@@ -194,11 +205,36 @@ async fn cancel_handler(
         .unwrap()
 }
 
+/// GET /v1/sessions: the client-key-authenticated read used by `doctor`'s
+/// auth check. Valid key → 200, anything else → 401.
+async fn sessions_handler(headers: HeaderMap) -> Response {
+    let key = headers
+        .get("x-muxi-client-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if key == "test-key-123" {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"sessions": []}).to_string()))
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"error": "invalid client key", "code": "UNAUTHORIZED"}).to_string(),
+            ))
+            .unwrap()
+    }
+}
+
 async fn start_fake_server() -> (SocketAddr, Arc<ServerState>) {
     let state = Arc::new(ServerState::default());
     let app = Router::new()
         .route("/v1/chat", post(chat_handler))
         .route("/v1/requests/{request_id}", delete(cancel_handler))
+        .route("/v1/sessions", get(sessions_handler))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -211,6 +247,33 @@ async fn start_fake_server() -> (SocketAddr, Arc<ServerState>) {
 // ---------------------------------------------------------------------------
 // ACP client harness over the bridge's stdio
 // ---------------------------------------------------------------------------
+
+/// Write a config file pointing at the fake server; `extra_config` is
+/// appended inside `[profiles.test]`.
+fn write_config(
+    addr: SocketAddr,
+    config_dir: &std::path::Path,
+    extra_config: &str,
+) -> std::path::PathBuf {
+    let config_path = config_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+default_profile = "test"
+
+[profiles.test]
+base_url = "http://{addr}/v1"
+client_key = "env:MUXI_ACP_TEST_KEY"
+# The fake server is plaintext loopback; TLS enforcement requires the opt-in.
+allow_insecure_localhost = true
+{extra_config}
+"#
+        ),
+    )
+    .unwrap();
+    config_path
+}
 
 struct AcpChild {
     child: Child,
@@ -233,23 +296,7 @@ impl AcpChild {
         config_dir: &std::path::Path,
         extra_config: &str,
     ) -> Self {
-        let config_path = config_dir.join("config.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-default_profile = "test"
-
-[profiles.test]
-base_url = "http://{addr}/v1"
-client_key = "env:MUXI_ACP_TEST_KEY"
-# The fake server is plaintext loopback; TLS enforcement requires the opt-in.
-allow_insecure_localhost = true
-{extra_config}
-"#
-            ),
-        )
-        .unwrap();
+        let config_path = write_config(addr, config_dir, extra_config);
 
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_muxi-acp"))
             .arg("--config")
@@ -767,4 +814,121 @@ async fn stdin_eof_cancels_active_turn_and_exits_cleanly() {
         .expect("bridge did not exit after stdin EOF")
         .expect("wait failed");
     assert!(status.success(), "expected exit 0, got {status:?}");
+}
+
+// ---------------------------------------------------------------------------
+// doctor: production dependency probe (no billable turn)
+// ---------------------------------------------------------------------------
+
+/// Run `muxi-acp doctor` against the fake server and return (exit ok, stdout).
+async fn run_doctor(addr: SocketAddr, key: &str, json: bool) -> (bool, String) {
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = write_config(addr, config_dir.path(), "");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_muxi-acp"));
+    command
+        .arg("--config")
+        .arg(&config_path)
+        .arg("doctor")
+        .env("MUXI_ACP_TEST_KEY", key)
+        .env("RUST_LOG", "info");
+    if json {
+        command.arg("--json");
+    }
+    let output = timeout(STEP_TIMEOUT, command.output())
+        .await
+        .expect("doctor timed out")
+        .expect("spawn muxi-acp doctor");
+    (
+        output.status.success(),
+        String::from_utf8(output.stdout).expect("doctor stdout must be UTF-8"),
+    )
+}
+
+/// Every check passes against the fake server (which answers GET /v1/sessions
+/// with 200 for the right key and 404 for the doctor's cancel probe) and the
+/// process exits 0. `--json` yields a machine-readable array; doctor must not
+/// have started a chat turn (no billable model turn).
+#[tokio::test]
+async fn doctor_all_checks_pass_and_exit_zero() {
+    let (addr, server) = start_fake_server().await;
+
+    let (ok, stdout) = run_doctor(addr, "test-key-123", true).await;
+    assert!(ok, "doctor should exit 0; stdout:\n{stdout}");
+    let checks: Value = serde_json::from_str(&stdout).expect("doctor --json must emit JSON");
+    let checks = checks.as_array().expect("doctor --json must emit an array");
+    let expected = [
+        "config",
+        "tls-policy",
+        "dns",
+        "tcp+tls",
+        "auth",
+        "streaming",
+        "cancellation",
+        "identity",
+    ];
+    assert_eq!(checks.len(), expected.len(), "{checks:#?}");
+    for name in expected {
+        let check = checks
+            .iter()
+            .find(|c| c["check"] == name)
+            .unwrap_or_else(|| panic!("missing check '{name}': {checks:#?}"));
+        assert_eq!(check["status"], "pass", "check '{name}': {check:#?}");
+        assert!(check["detail"].is_string(), "{check:#?}");
+    }
+    // The cancellation probe is honest about what 404 proves.
+    let cancel = checks
+        .iter()
+        .find(|c| c["check"] == "cancellation")
+        .unwrap();
+    assert!(
+        cancel["detail"].as_str().unwrap().contains("404"),
+        "{cancel:#?}"
+    );
+    // Secrets are never echoed.
+    assert!(!stdout.contains("test-key-123"), "key leaked:\n{stdout}");
+
+    // No billable turn: the fake server saw no POST /v1/chat.
+    assert!(
+        server.chat_payloads.lock().unwrap().is_empty(),
+        "doctor must never start a chat turn"
+    );
+
+    // Human report also passes and carries the summary line.
+    let (ok, stdout) = run_doctor(addr, "test-key-123", false).await;
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains("PASS"), "{stdout}");
+    assert!(stdout.contains("doctor: ok (8 pass)"), "{stdout}");
+}
+
+/// A wrong client key must fail the auth check (401 → bad credentials) and
+/// exit 1, while unrelated checks still report independently.
+#[tokio::test]
+async fn doctor_bad_key_fails_auth_and_exits_one() {
+    let (addr, _server) = start_fake_server().await;
+
+    let (ok, stdout) = run_doctor(addr, "wrong-key", true).await;
+    assert!(
+        !ok,
+        "doctor should exit 1 on auth failure; stdout:\n{stdout}"
+    );
+    let checks: Value = serde_json::from_str(&stdout).unwrap();
+    let checks = checks.as_array().unwrap();
+    let status_of = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["check"] == name)
+            .unwrap_or_else(|| panic!("missing check '{name}'"))
+            .clone()
+    };
+    let auth = status_of("auth");
+    assert_eq!(auth["status"], "fail", "{auth:#?}");
+    assert!(
+        auth["detail"].as_str().unwrap().contains("401"),
+        "{auth:#?}"
+    );
+    // The run continued past the failure: independent checks still pass.
+    for name in ["config", "tls-policy", "dns", "tcp+tls", "identity"] {
+        assert_eq!(status_of(name)["status"], "pass", "check '{name}'");
+    }
+    assert!(!stdout.contains("wrong-key"), "key leaked:\n{stdout}");
 }
