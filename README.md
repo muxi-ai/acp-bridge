@@ -127,4 +127,4 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 
 ## License
 
-MIT
+Apache 2.0 — matching the MUXI SDKs and tooling (the runtime and server are ELv2).

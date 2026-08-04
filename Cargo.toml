@@ -2,7 +2,7 @@
 name = "muxi-acp"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "ACP <-> MUXI bridge: presents a remote MUXI formation as an Agent Client Protocol agent"
 repository = "https://github.com/muxi-ai/acp-bridge"
 
