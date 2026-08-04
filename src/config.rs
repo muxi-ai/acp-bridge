@@ -227,7 +227,7 @@ pub fn select_profile(
     }
 }
 
-/// Resolve a secret reference. Schemes: `env:` | `file:` | `keychain:` (stub).
+/// Resolve a secret reference. Schemes: `env:` | `file:` | `keychain:`.
 /// Literal values are rejected — secrets never live in the config file.
 pub fn resolve_secret(reference: &str) -> Result<String, ConfigError> {
     if let Some(var) = reference.strip_prefix("env:") {
@@ -237,16 +237,103 @@ pub fn resolve_secret(reference: &str) -> Result<String, ConfigError> {
         std::fs::read_to_string(path)
             .map(|contents| contents.trim().to_string())
             .map_err(|err| ConfigError::Secret(format!("cannot read '{path}': {err}")))
-    } else if reference.starts_with("keychain:") {
-        // TODO: OS keychain integration is a later build-order step (spec §9.6).
-        Err(ConfigError::Secret(
-            "keychain: references are not yet implemented".to_string(),
-        ))
+    } else if let Some(rest) = reference.strip_prefix("keychain:") {
+        let (service, account) = parse_keychain_reference(rest)?;
+        keychain_lookup(service, account)
     } else {
         Err(ConfigError::Secret(
-            "client_key must be a secret reference (env:NAME, file:/path, or keychain:...), never a literal".to_string(),
+            "client_key must be a secret reference (env:NAME, file:/path, or \
+             keychain:<service>/<account>), never a literal"
+                .to_string(),
         ))
     }
+}
+
+/// Parse `keychain:<service>/<account>`: split on the FIRST slash, so the
+/// account may itself contain slashes (`keychain:muxi-acp/prod/client-key`
+/// is service `muxi-acp`, account `prod/client-key`).
+fn parse_keychain_reference(rest: &str) -> Result<(&str, &str), ConfigError> {
+    let Some((service, account)) = rest.split_once('/') else {
+        return Err(ConfigError::Secret(format!(
+            "keychain reference 'keychain:{rest}' is missing an account; the form is \
+             'keychain:<service>/<account>'"
+        )));
+    };
+    if service.is_empty() {
+        return Err(ConfigError::Secret(
+            "keychain reference has an empty service; the form is \
+             'keychain:<service>/<account>'"
+                .to_string(),
+        ));
+    }
+    if account.is_empty() {
+        return Err(ConfigError::Secret(
+            "keychain reference has an empty account; the form is \
+             'keychain:<service>/<account>'"
+                .to_string(),
+        ));
+    }
+    Ok((service, account))
+}
+
+/// Read one secret from the OS keychain (macOS Keychain, Windows Credential
+/// Manager, Linux Secret Service via the pure-Rust zbus D-Bus client).
+///
+/// The lookup runs on a dedicated OS thread: the Linux store drives its own
+/// D-Bus executor with blocking waits, and parking a fresh thread can never
+/// collide with the bridge's tokio runtime. Startup-only cost, one join.
+fn keychain_lookup(service: &str, account: &str) -> Result<String, ConfigError> {
+    let service = service.to_string();
+    let account = account.to_string();
+    std::thread::spawn(move || {
+        let entry = keyring::Entry::new(&service, &account)
+            .map_err(|err| map_keyring_error(&service, &account, err))?;
+        entry
+            .get_password()
+            .map_err(|err| map_keyring_error(&service, &account, err))
+    })
+    .join()
+    .map_err(|_| ConfigError::Secret("keychain lookup thread panicked".to_string()))?
+}
+
+/// Map a `keyring` error onto an actionable message. Distinguishes "entry
+/// not found" (fix: create it) from "keychain denied/unavailable" (fix:
+/// unlock/grant/start the service). NEVER includes any retrieved value —
+/// note that `BadEncoding` carries the raw secret bytes, so its payload (and
+/// its `Display`, which is safe today but not contractually) must not be
+/// echoed.
+fn map_keyring_error(service: &str, account: &str, err: keyring::Error) -> ConfigError {
+    use keyring::Error as KeyringError;
+    ConfigError::Secret(match err {
+        KeyringError::NoEntry => format!(
+            "keychain entry not found for service '{service}', account '{account}'; create it \
+             first (macOS: security add-generic-password -s '{service}' -a '{account}' -w)"
+        ),
+        KeyringError::Ambiguous(matches) => format!(
+            "keychain holds {} entries matching service '{service}', account '{account}'; \
+             delete the duplicates so exactly one remains",
+            matches.len()
+        ),
+        KeyringError::NoStorageAccess(err) => format!(
+            "keychain access denied for service '{service}', account '{account}': {err}; \
+             unlock the keychain or grant this binary access, then retry"
+        ),
+        KeyringError::PlatformFailure(err) => format!(
+            "keychain unavailable ({err}); on Linux a Secret Service provider (GNOME Keyring \
+             or KWallet) must be running on the session D-Bus"
+        ),
+        KeyringError::NoDefaultStore => format!(
+            "no OS keychain is available on this platform for service '{service}', account \
+             '{account}'; use an env: or file: reference instead"
+        ),
+        KeyringError::BadEncoding(_) => format!(
+            "keychain entry for service '{service}', account '{account}' is not valid UTF-8; \
+             re-create it as a plain-text password"
+        ),
+        other => {
+            format!("keychain lookup failed for service '{service}', account '{account}': {other}")
+        }
+    })
 }
 
 impl Profile {
@@ -556,9 +643,106 @@ mod tests {
     }
 
     #[test]
-    fn keychain_is_a_stub_and_literals_are_rejected() {
-        assert!(resolve_secret("keychain:muxi-acp/prod").is_err());
-        assert!(resolve_secret("literal-key-value").is_err());
+    fn literals_are_rejected() {
+        let err = resolve_secret("literal-key-value").unwrap_err();
+        assert!(err.to_string().contains("never a literal"), "{err}");
+    }
+
+    #[test]
+    fn keychain_reference_parses_on_first_slash() {
+        // Account may contain slashes: split on the FIRST one only.
+        assert_eq!(
+            parse_keychain_reference("muxi-acp/prod").unwrap(),
+            ("muxi-acp", "prod")
+        );
+        assert_eq!(
+            parse_keychain_reference("muxi-acp/prod/client-key").unwrap(),
+            ("muxi-acp", "prod/client-key")
+        );
+    }
+
+    #[test]
+    fn keychain_reference_shape_errors_are_actionable() {
+        for (reference, expected) in [
+            ("no-slash-here", "missing an account"),
+            ("/account-only", "empty service"),
+            ("service-only/", "empty account"),
+        ] {
+            let err = parse_keychain_reference(reference).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(expected), "{reference}: {message}");
+            assert!(
+                message.contains("keychain:<service>/<account>"),
+                "{reference}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn keychain_error_mapping_distinguishes_not_found_from_access_denied() {
+        // Not found: actionable "create it" guidance naming service+account.
+        let not_found = map_keyring_error("muxi-acp", "prod", keyring::Error::NoEntry).to_string();
+        assert!(not_found.contains("not found"), "{not_found}");
+        assert!(not_found.contains("muxi-acp"), "{not_found}");
+        assert!(not_found.contains("prod"), "{not_found}");
+        assert!(not_found.contains("create it"), "{not_found}");
+
+        // Access denied: "unlock/grant" guidance, distinct from not-found.
+        let denied = map_keyring_error(
+            "muxi-acp",
+            "prod",
+            keyring::Error::NoStorageAccess("keychain is locked".into()),
+        )
+        .to_string();
+        assert!(denied.contains("access denied"), "{denied}");
+        assert!(denied.contains("unlock"), "{denied}");
+        assert!(!denied.contains("not found"), "{denied}");
+
+        // Unavailable platform store: points at the Linux Secret Service.
+        let unavailable = map_keyring_error(
+            "muxi-acp",
+            "prod",
+            keyring::Error::PlatformFailure("dbus not running".into()),
+        )
+        .to_string();
+        assert!(unavailable.contains("unavailable"), "{unavailable}");
+
+        // A non-UTF-8 entry must never echo the raw bytes.
+        let secret_bytes = b"\xffsuper-secret\xfe".to_vec();
+        let bad = map_keyring_error(
+            "muxi-acp",
+            "prod",
+            keyring::Error::BadEncoding(secret_bytes),
+        )
+        .to_string();
+        assert!(bad.contains("not valid UTF-8"), "{bad}");
+        assert!(!bad.contains("super-secret"), "value echoed: {bad}");
+    }
+
+    /// Live keychain roundtrip — touches the real OS keychain, so it is gated
+    /// behind MUXI_ACP_KEYCHAIN_TESTS=1 and skipped in headless CI. Run it
+    /// locally with:
+    ///
+    /// ```sh
+    /// MUXI_ACP_KEYCHAIN_TESTS=1 cargo test keychain_live
+    /// ```
+    #[test]
+    fn keychain_live_roundtrip() {
+        if std::env::var("MUXI_ACP_KEYCHAIN_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping keychain_live_roundtrip (set MUXI_ACP_KEYCHAIN_TESTS=1 to run)");
+            return;
+        }
+        let service = "muxi-acp-test";
+        let account = "live/roundtrip"; // slash in the account, on purpose
+        let entry = keyring::Entry::new(service, account).unwrap();
+        entry.set_password("live-test-value").unwrap();
+        let resolved = resolve_secret(&format!("keychain:{service}/{account}"));
+        entry.delete_credential().unwrap();
+        assert_eq!(resolved.unwrap(), "live-test-value");
+
+        // And a missing entry maps to the not-found error, not a panic.
+        let missing = resolve_secret("keychain:muxi-acp-test/definitely-not-there").unwrap_err();
+        assert!(missing.to_string().contains("not found"), "{missing}");
     }
 
     #[test]

@@ -24,6 +24,13 @@ use tokio::time::timeout;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
+// Redaction canaries: distinctive strings that must reach the ACP host over
+// stdout (protocol) but must never appear on stderr at RUST_LOG=info.
+const PROMPT_CANARY: &str = "PROMPT-CANARY-5b7de1";
+const RESPONSE_CANARY: &str = "RESPONSE-CANARY-c4f2d7";
+const UPSTREAM_ERROR_CANARY: &str = "UPSTREAM-ERROR-CANARY-e19b30";
+const CHANNEL_CANARY: &str = "CHANNEL-CANARY-90aa41";
+
 // ---------------------------------------------------------------------------
 // Fake MUXI formation server
 // ---------------------------------------------------------------------------
@@ -185,6 +192,19 @@ async fn chat_handler(
                 )],
             )
         }
+        // Redaction canaries (stderr leakage test): a clean turn whose
+        // response carries a distinctive marker...
+        canary if canary.starts_with("redaction-happy") => sse_response(vec![
+            data_frame(stamp(
+                json!({"type": "content", "content": RESPONSE_CANARY}),
+            )),
+            data_frame(stamp(json!({"type": "completed"}))),
+            format!("event: done\ndata: {}\n\n", json!({"finished": true})),
+        ]),
+        // ...and an upstream error whose message carries one.
+        "redaction-error" => sse_response(vec![data_frame(stamp(
+            json!({"type": "error", "error": UPSTREAM_ERROR_CANARY}),
+        ))]),
         // A Buzz-shaped prompt (identity extraction test): reply and finish.
         buzz if buzz.contains("[Buzz event") => sse_response(vec![
             data_frame(stamp(json!({"type": "content", "content": "ack"}))),
@@ -298,6 +318,9 @@ struct AcpChild {
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
     /// Every raw stdout line, for byte-level discipline assertions.
     raw_stdout: Vec<String>,
+    /// Drains the child's stderr when spawned with capture (redaction test);
+    /// `None` when stderr is inherited.
+    stderr_task: Option<tokio::task::JoinHandle<String>>,
     next_id: i64,
 }
 
@@ -313,6 +336,26 @@ impl AcpChild {
         config_dir: &std::path::Path,
         extra_config: &str,
     ) -> Self {
+        Self::spawn_inner(addr, config_dir, extra_config, false).await
+    }
+
+    /// Like `spawn_with_config`, but pipes stderr and drains it concurrently
+    /// (so the child can never block on a full stderr pipe). The captured
+    /// text is retrieved with `collect_stderr` after the child exits.
+    async fn spawn_capturing_stderr(
+        addr: SocketAddr,
+        config_dir: &std::path::Path,
+        extra_config: &str,
+    ) -> Self {
+        Self::spawn_inner(addr, config_dir, extra_config, true).await
+    }
+
+    async fn spawn_inner(
+        addr: SocketAddr,
+        config_dir: &std::path::Path,
+        extra_config: &str,
+        capture_stderr: bool,
+    ) -> Self {
         let config_path = write_config(addr, config_dir, extra_config);
 
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_muxi-acp"))
@@ -322,20 +365,43 @@ impl AcpChild {
             .env("RUST_LOG", "info")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if capture_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .kill_on_drop(true)
             .spawn()
             .expect("spawn muxi-acp");
 
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        let stderr_task = capture_stderr.then(|| {
+            let mut stderr = child.stderr.take().unwrap();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut captured = String::new();
+                stderr.read_to_string(&mut captured).await.unwrap();
+                captured
+            })
+        });
         Self {
             child,
             stdin: Some(stdin),
             stdout,
             raw_stdout: Vec::new(),
+            stderr_task,
             next_id: 0,
         }
+    }
+
+    /// Await the stderr drain task (call after the child exited).
+    async fn collect_stderr(&mut self) -> String {
+        self.stderr_task
+            .take()
+            .expect("child was not spawned with stderr capture")
+            .await
+            .unwrap()
     }
 
     async fn send(&mut self, message: Value) {
@@ -868,6 +934,107 @@ host_unit = "channel"
         let user_ids = server.seen_user_ids.lock().unwrap();
         assert_eq!(user_ids.len(), 2);
         assert_eq!(user_ids[1], format!("acp:{session_id}"));
+    }
+}
+
+/// Redaction policy (README "Logging & redaction"): at RUST_LOG=info the
+/// bridge's stderr must never contain prompt text, response text, upstream
+/// error message text, or the client key. Content flows over stdout as
+/// protocol; stderr carries only ids, codes, and lengths.
+#[tokio::test]
+async fn info_stderr_never_leaks_content_or_credentials() {
+    let (addr, _server) = start_fake_server().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    // Buzz extraction enabled so its parse-miss WARN paths run too.
+    let mut acp = AcpChild::spawn_capturing_stderr(
+        addr,
+        config_dir.path(),
+        r#"
+[profiles.test.identity]
+host = "buzz"
+"#,
+    )
+    .await;
+    let session_id = establish_session(&mut acp).await;
+
+    // Happy path: prompt and response both carry canaries. The response must
+    // reach the host over stdout (protocol) — the leak check is stderr-only.
+    let (updates, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": format!("redaction-happy {PROMPT_CANARY}")}]
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert!(
+        updates.iter().any(|u| chunk_text(u) == RESPONSE_CANARY),
+        "response canary must reach the host: {updates:#?}"
+    );
+
+    // Upstream error: the message must reach the host in the JSON-RPC error,
+    // while stderr logs only its code and length.
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "redaction-error"}]
+            }),
+        )
+        .await;
+    assert_eq!(
+        response["error"]["message"], UPSTREAM_ERROR_CANARY,
+        "{response}"
+    );
+
+    // Buzz parse-miss on a malformed Channel line: the WARN diagnostic must
+    // not quote the offending line (it contains prompt content).
+    let alice = "a".repeat(64);
+    let bad_buzz = format!(
+        "[Buzz event: mention]\n\
+         Channel: general (#{CHANNEL_CANARY})\n\
+         From: alice (npub: npub1alice, hex: {alice})\n\
+         Content: hello\n"
+    );
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": bad_buzz}]
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+    // Shut down cleanly, then sweep the whole stderr capture.
+    acp.close_stdin();
+    let status = timeout(Duration::from_secs(10), acp.child.wait())
+        .await
+        .expect("bridge did not exit after stdin EOF")
+        .expect("wait failed");
+    assert!(status.success(), "expected exit 0, got {status:?}");
+    let stderr = acp.collect_stderr().await;
+
+    // Sanity: logging was on and captured (the prompt log line is info-level).
+    assert!(
+        stderr.contains("session/prompt"),
+        "expected info logs on stderr; got:\n{stderr}"
+    );
+    for canary in [
+        PROMPT_CANARY,
+        RESPONSE_CANARY,
+        UPSTREAM_ERROR_CANARY,
+        CHANNEL_CANARY,
+        "test-key-123",
+    ] {
+        assert!(
+            !stderr.contains(canary),
+            "'{canary}' leaked into info-level stderr:\n{stderr}"
+        );
     }
 }
 

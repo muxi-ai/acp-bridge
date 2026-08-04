@@ -138,8 +138,15 @@ impl BuzzPromptExtractor {
                     .flat_map(|section| section.iter())
                     .find(|line| line.starts_with("Channel: "))
                     .ok_or("no `Channel:` line in Buzz events block")?;
+                // Redaction: the reason never quotes the line — parse-miss
+                // reasons are logged at WARN and prompt text must not leak
+                // into stderr (see README "Logging & redaction").
                 let uuid = channel_uuid(line).ok_or_else(|| {
-                    format!("first `Channel:` line has no valid `(#<uuid>)`: {line:?}")
+                    format!(
+                        "first `Channel:` line has no valid `(#<uuid>)` capture \
+                         ({} bytes)",
+                        line.len()
+                    )
                 })?;
                 format!("{}:channel:{uuid}", self.id_prefix)
             }
@@ -496,5 +503,92 @@ mod tests {
         let extractor = host_extractor_from(&identity).unwrap();
         let extracted = extractor.extract(&multi_event_prompt()).unwrap();
         assert_eq!(extracted.user_id, format!("buzz:channel:{UUID}"));
+    }
+}
+
+/// Property tests: prompt text is hostile input (see the module docs), so the
+/// extractor must never panic and never emit a malformed id — for *any* text,
+/// the outcome is either `None` or an id whose captured part is a strictly
+/// valid uuid / 64-hex pubkey. Case counts stay CI-friendly (256–512).
+#[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// The output invariant: `None`, or `<prefix>:channel:<valid uuid>` /
+    /// `<prefix>:pubkey:<valid 64-hex>` — never a partial or mangled id.
+    fn assert_valid_extraction(unit: HostUnit, extracted: Option<ExtractedIdentity>, text: &str) {
+        let Some(identity) = extracted else { return };
+        let id = &identity.user_id;
+        match unit {
+            HostUnit::Channel => {
+                let uuid = id
+                    .strip_prefix("pfx:channel:")
+                    .unwrap_or_else(|| panic!("bad id shape {id:?} for {text:?}"));
+                assert!(is_uuid(uuid), "invalid uuid in {id:?} for {text:?}");
+            }
+            HostUnit::Sender => {
+                let hex = id
+                    .strip_prefix("pfx:pubkey:")
+                    .unwrap_or_else(|| panic!("bad id shape {id:?} for {text:?}"));
+                assert!(is_hex64(hex), "invalid pubkey in {id:?} for {text:?}");
+            }
+        }
+    }
+
+    fn arb_unit() -> impl Strategy<Value = HostUnit> {
+        prop_oneof![Just(HostUnit::Channel), Just(HostUnit::Sender)]
+    }
+
+    /// Lines biased toward the parser's own vocabulary — headers, separators,
+    /// near-miss `Channel:`/`From:` lines with variable-length hex — so the
+    /// generator spends its cases inside the parsing paths rather than on
+    /// text that misses the block marker entirely.
+    fn arb_buzz_line() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("[Buzz events — 2 events]".to_string()),
+            "\\[Buzz events — [0-9]{1,3} events?\\]",
+            "\\[Buzz event: [a-z]{0,8}\\]",
+            "--- Event [0-9]{1,2} \\([a-z]{0,8}\\) ---",
+            "Channel: [a-z ()#]{0,12}\\(#[0-9a-f-]{0,40}\\)",
+            "Channel: general \\(#[0-9a-fA-F]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\)",
+            "From: [a-z ()]{0,10}\\(npub: npub1[a-z]{0,6}, hex: [0-9a-fA-F]{0,70}\\)",
+            "From: [a-z]{1,6} \\(hex: [0-9a-f]{60,68}\\)",
+            "Content: .{0,40}",
+            ".{0,40}",
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Wholly arbitrary text (multi-line via generated \n's included).
+        #[test]
+        fn arbitrary_text_never_panics_or_yields_malformed_ids(
+            text in ".*",
+            unit in arb_unit(),
+        ) {
+            let extractor = BuzzPromptExtractor::new(unit, "pfx".to_string());
+            let extracted = extractor.extract(&text);
+            assert_valid_extraction(unit, extracted, &text);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(384))]
+
+        /// Buzz-shaped (and near-miss-shaped) line soup drives deep into the
+        /// section/capture logic.
+        #[test]
+        fn buzz_shaped_line_soup_never_panics_or_yields_malformed_ids(
+            lines in prop::collection::vec(arb_buzz_line(), 0..12),
+            unit in arb_unit(),
+        ) {
+            let text = lines.join("\n");
+            let extractor = BuzzPromptExtractor::new(unit, "pfx".to_string());
+            let extracted = extractor.extract(&text);
+            assert_valid_extraction(unit, extracted, &text);
+        }
     }
 }
