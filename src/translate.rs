@@ -20,6 +20,9 @@ pub const CODE_UPSTREAM_ERROR: &str = "BRIDGE_UPSTREAM_ERROR";
 pub const CODE_TRANSPORT_ERROR: &str = "BRIDGE_TRANSPORT_ERROR";
 
 /// What a single MUXI SSE frame means for the current ACP turn.
+// `Update` dominates the enum size, but values are translated and consumed
+// one frame at a time — never stored in bulk — so boxing buys nothing here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     /// Forward a `session/update` notification.
@@ -59,7 +62,9 @@ impl Translator {
             "ui" => Vec::new(),
             // The SDK converts named `event: error` frames into `Err` items,
             // but handle one defensively if it ever reaches us.
-            "error" => vec![upstream_error(&parse_json(&event.data).unwrap_or(Value::Null))],
+            "error" => vec![upstream_error(
+                &parse_json(&event.data).unwrap_or(Value::Null),
+            )],
             _ => self.translate_data_frame(&event.data),
         }
     }
@@ -96,11 +101,7 @@ impl Translator {
             "planning" | "replanning" => {
                 let text = event_text(&obj);
                 vec![TurnEvent::Update(SessionUpdate::Plan(Plan::new(vec![
-                    PlanEntry::new(
-                        text,
-                        PlanEntryPriority::Medium,
-                        PlanEntryStatus::InProgress,
-                    ),
+                    PlanEntry::new(text, PlanEntryPriority::Medium, PlanEntryStatus::InProgress),
                 ])))]
             }
             "tool_call" => self.translate_tool_call(&obj),
@@ -386,7 +387,10 @@ mod tests {
     #[test]
     fn named_error_frame_fails_the_turn() {
         let mut t = Translator::new(false);
-        let out = t.translate(&named("error", r#"{"error":"boom","type":"RUNTIME_ERROR"}"#));
+        let out = t.translate(&named(
+            "error",
+            r#"{"error":"boom","type":"RUNTIME_ERROR"}"#,
+        ));
         assert_eq!(out.len(), 1);
         match &out[0] {
             TurnEvent::Error { code, message } => {

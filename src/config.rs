@@ -73,7 +73,9 @@ impl std::error::Error for ConfigError {}
 /// Default config location: `$XDG_CONFIG_HOME/muxi-acp/config.toml`
 /// (macOS: `~/Library/Application Support/muxi-acp/config.toml`).
 pub fn default_config_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let base = if cfg!(target_os = "macos") {
         home.join("Library/Application Support")
     } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -85,8 +87,8 @@ pub fn default_config_path() -> PathBuf {
 }
 
 pub fn load(path: &Path) -> Result<ConfigFile, ConfigError> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|err| ConfigError::Io(path.to_path_buf(), err))?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|err| ConfigError::Io(path.to_path_buf(), err))?;
     toml::from_str(&raw).map_err(|err| ConfigError::Parse(path.to_path_buf(), err))
 }
 
@@ -111,9 +113,8 @@ pub fn select_profile(config: &ConfigFile, name: Option<&str>) -> Result<Profile
 /// Literal values are rejected — secrets never live in the config file.
 pub fn resolve_secret(reference: &str) -> Result<String, ConfigError> {
     if let Some(var) = reference.strip_prefix("env:") {
-        std::env::var(var).map_err(|_| {
-            ConfigError::Secret(format!("environment variable '{var}' is not set"))
-        })
+        std::env::var(var)
+            .map_err(|_| ConfigError::Secret(format!("environment variable '{var}' is not set")))
     } else if let Some(path) = reference.strip_prefix("file:") {
         std::fs::read_to_string(path)
             .map(|contents| contents.trim().to_string())
@@ -202,7 +203,10 @@ mod tests {
         assert!(select_profile(&config, None).unwrap().server_url.is_some());
         let direct = select_profile(&config, Some("direct")).unwrap();
         assert!(direct.forward_thoughts);
-        assert_eq!(direct.identity.default_user_id.as_deref(), Some("shared-brain"));
+        assert_eq!(
+            direct.identity.default_user_id.as_deref(),
+            Some("shared-brain")
+        );
         assert!(matches!(
             select_profile(&config, Some("nope")),
             Err(ConfigError::UnknownProfile(_))
@@ -212,8 +216,14 @@ mod tests {
     #[test]
     fn endpoint_validation() {
         let config = sample();
-        select_profile(&config, Some("prod")).unwrap().validate_endpoint().unwrap();
-        select_profile(&config, Some("direct")).unwrap().validate_endpoint().unwrap();
+        select_profile(&config, Some("prod"))
+            .unwrap()
+            .validate_endpoint()
+            .unwrap();
+        select_profile(&config, Some("direct"))
+            .unwrap()
+            .validate_endpoint()
+            .unwrap();
 
         let bad = Profile {
             server_url: Some("https://x".into()),

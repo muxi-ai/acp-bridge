@@ -6,7 +6,10 @@ use serde_json::{json, Value};
 use crate::config::{ConfigError, Profile};
 
 /// Build a `FormationClient` from a resolved profile + client key.
-pub fn client_from_profile(profile: &Profile, client_key: &str) -> Result<FormationClient, ConfigError> {
+pub fn client_from_profile(
+    profile: &Profile,
+    client_key: &str,
+) -> Result<FormationClient, ConfigError> {
     let config = if let Some(base_url) = &profile.base_url {
         FormationConfig::with_base_url(base_url, client_key, "")
     } else {
@@ -17,8 +20,7 @@ pub fn client_from_profile(profile: &Profile, client_key: &str) -> Result<Format
         };
         FormationConfig::new(server_url, formation, client_key, "")
     };
-    FormationClient::new(config)
-        .map_err(|err| ConfigError::InvalidEndpoint(err.to_string()))
+    FormationClient::new(config).map_err(|err| ConfigError::InvalidEndpoint(err.to_string()))
 }
 
 /// Chat payload per binding spec §3: `request_id` is bridge-generated and

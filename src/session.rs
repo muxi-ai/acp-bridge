@@ -96,7 +96,11 @@ impl SessionRegistry {
     }
 
     /// Begin a turn, enforcing one active turn per session.
-    pub fn begin_turn(&self, session_id: &str, request_id: &str) -> Result<CancellationToken, TurnError> {
+    pub fn begin_turn(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<CancellationToken, TurnError> {
         let mut inner = self.inner.lock().unwrap();
         let entry = inner.get_mut(session_id).ok_or(TurnError::UnknownSession)?;
         if entry.active_turn.is_some() {

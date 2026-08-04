@@ -1,0 +1,511 @@
+//! End-to-end test: spawn the built `muxi-acp` binary, speak ACP JSON-RPC
+//! over its stdin/stdout, and point it at a fake MUXI formation server that
+//! replays recorded-style SSE fixtures.
+//!
+//! Also enforces byte-level stdout discipline: nothing non-JSON-RPC may
+//! appear on stdout.
+
+use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::Response;
+use axum::routing::{delete, post};
+use axum::Router;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::time::timeout;
+
+const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+// ---------------------------------------------------------------------------
+// Fake MUXI formation server
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct ServerState {
+    cancelled_request_ids: Mutex<Vec<String>>,
+    seen_client_keys: Mutex<Vec<String>>,
+    chat_payloads: Mutex<Vec<Value>>,
+}
+
+fn sse_response(frames: Vec<String>) -> Response {
+    sse_response_with_hang(frames, Vec::new())
+}
+
+/// Send `frames`, then (if `after_hang` is non-empty) wait 30s and send those.
+/// The hang gives a cancellation test time to interrupt the stream.
+fn sse_response_with_hang(frames: Vec<String>, after_hang: Vec<String>) -> Response {
+    let stream = futures::stream::unfold(
+        (VecDeque::from(frames), VecDeque::from(after_hang), false),
+        |(mut head, mut tail, mut slept)| async move {
+            if let Some(frame) = head.pop_front() {
+                return Some((
+                    Ok::<_, std::convert::Infallible>(frame),
+                    (head, tail, slept),
+                ));
+            }
+            if !tail.is_empty() && !slept {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                slept = true;
+            }
+            tail.pop_front()
+                .map(|frame| (Ok(frame), (head, tail, slept)))
+        },
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+fn data_frame(value: Value) -> String {
+    format!("data: {value}\n\n")
+}
+
+async fn chat_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(key) = headers
+        .get("x-muxi-client-key")
+        .and_then(|value| value.to_str().ok())
+    {
+        state.seen_client_keys.lock().unwrap().push(key.to_string());
+    }
+
+    let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    state.chat_payloads.lock().unwrap().push(payload.clone());
+
+    let message = payload["message"].as_str().unwrap_or("");
+    let session_id = payload["session_id"].as_str().unwrap_or("").to_string();
+    let request_id = payload["request_id"].as_str().unwrap_or("").to_string();
+    let stamp = |mut value: Value| {
+        value["session_id"] = json!(session_id);
+        value["request_id"] = json!(request_id);
+        value
+    };
+
+    match message {
+        // content deltas -> thinking (should be gated) -> tool_call pair ->
+        // progress (dropped) -> completed -> ui -> done
+        "happy" => sse_response(vec![
+            ": keepalive\n\n".to_string(),
+            data_frame(stamp(json!({"type": "content", "content": "Hello"}))),
+            data_frame(stamp(json!({"type": "thinking", "content": "pondering"}))),
+            data_frame(stamp(json!({
+                "type": "tool_call", "tool_call_id": "tc_1",
+                "name": "search", "status": "running"
+            }))),
+            data_frame(stamp(json!({
+                "type": "tool_call", "tool_call_id": "tc_1",
+                "status": "completed", "content": "found it"
+            }))),
+            data_frame(stamp(json!({"type": "progress", "content": "80%"}))),
+            data_frame(stamp(json!({"type": "content", "content": " world"}))),
+            data_frame(stamp(json!({"type": "completed"}))),
+            format!(
+                "event: ui\ndata: {}\n\n",
+                json!({"ui": [{"type": "options", "id": "w1"}]})
+            ),
+            format!("event: done\ndata: {}\n\n", json!({"finished": true})),
+        ]),
+        // formation reports an error mid-turn
+        "error" => sse_response(vec![
+            data_frame(stamp(json!({"type": "content", "content": "partial"}))),
+            data_frame(stamp(json!({"type": "error", "error": "kaboom"}))),
+        ]),
+        // stream dies mid-turn: no terminal event, connection just ends
+        "truncate" => sse_response(vec![data_frame(stamp(
+            json!({"type": "content", "content": "partial"}),
+        ))]),
+        // first delta arrives, then the stream hangs (cancel test window)
+        "hang" => sse_response_with_hang(
+            vec![data_frame(stamp(
+                json!({"type": "content", "content": "started..."}),
+            ))],
+            vec![format!(
+                "event: done\ndata: {}\n\n",
+                json!({"finished": true})
+            )],
+        ),
+        other => panic!("fake server: unknown scenario '{other}'"),
+    }
+}
+
+async fn cancel_handler(
+    State(state): State<Arc<ServerState>>,
+    Path(request_id): Path<String>,
+) -> Response {
+    state.cancelled_request_ids.lock().unwrap().push(request_id);
+    // Mirror the known runtime defect: cancel returns 400 on success (§6).
+    // The bridge must treat this as diagnostic-only.
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"error": "already finished", "code": "REQUEST_NOT_ACTIVE"}).to_string(),
+        ))
+        .unwrap()
+}
+
+async fn start_fake_server() -> (SocketAddr, Arc<ServerState>) {
+    let state = Arc::new(ServerState::default());
+    let app = Router::new()
+        .route("/v1/chat", post(chat_handler))
+        .route("/v1/requests/{request_id}", delete(cancel_handler))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, state)
+}
+
+// ---------------------------------------------------------------------------
+// ACP client harness over the bridge's stdio
+// ---------------------------------------------------------------------------
+
+struct AcpChild {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    /// Every raw stdout line, for byte-level discipline assertions.
+    raw_stdout: Vec<String>,
+    next_id: i64,
+}
+
+impl AcpChild {
+    async fn spawn(addr: SocketAddr, config_dir: &std::path::Path) -> Self {
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+default_profile = "test"
+
+[profiles.test]
+base_url = "http://{addr}/v1"
+client_key = "env:MUXI_ACP_TEST_KEY"
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_muxi-acp"))
+            .arg("--config")
+            .arg(&config_path)
+            .env("MUXI_ACP_TEST_KEY", "test-key-123")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn muxi-acp");
+
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        Self {
+            _child: child,
+            stdin,
+            stdout,
+            raw_stdout: Vec::new(),
+            next_id: 0,
+        }
+    }
+
+    async fn send(&mut self, message: Value) {
+        let mut line = message.to_string();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await.unwrap();
+        self.stdin.flush().await.unwrap();
+    }
+
+    async fn read_message(&mut self) -> Value {
+        let line = timeout(STEP_TIMEOUT, self.stdout.next_line())
+            .await
+            .expect("timed out waiting for a message from the bridge")
+            .expect("stdout read failed")
+            .expect("bridge closed stdout unexpectedly");
+        self.raw_stdout.push(line.clone());
+        serde_json::from_str(&line).unwrap_or_else(|err| {
+            panic!("stdout discipline violated: non-JSON line {line:?}: {err}")
+        })
+    }
+
+    /// Send a request; collect `session/update` notifications until the
+    /// response for this request id arrives. Returns (notifications, response).
+    async fn request(&mut self, method: &str, params: Value) -> (Vec<Value>, Value) {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .await;
+        self.read_until_response(id).await
+    }
+
+    async fn read_until_response(&mut self, id: i64) -> (Vec<Value>, Value) {
+        let mut notifications = Vec::new();
+        loop {
+            let message = self.read_message().await;
+            if message.get("id") == Some(&json!(id)) {
+                return (notifications, message);
+            }
+            assert_eq!(
+                message["method"], "session/update",
+                "unexpected interleaved message: {message}"
+            );
+            notifications.push(message);
+        }
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) {
+        self.send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
+            .await;
+    }
+}
+
+fn update_kind(notification: &Value) -> &str {
+    notification["params"]["update"]["sessionUpdate"]
+        .as_str()
+        .unwrap_or("?")
+}
+
+fn chunk_text(notification: &Value) -> &str {
+    notification["params"]["update"]["content"]["text"]
+        .as_str()
+        .unwrap_or("?")
+}
+
+// ---------------------------------------------------------------------------
+// The test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bridge_end_to_end() {
+    let (addr, server) = start_fake_server().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut acp = AcpChild::spawn(addr, config_dir.path()).await;
+
+    // -- initialize: honest capability set (§4) --------------------------------
+    let (_, response) = acp
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientInfo": {"name": "e2e", "version": "0"}}),
+        )
+        .await;
+    let caps = &response["result"]["agentCapabilities"];
+    assert_eq!(caps["loadSession"], json!(false));
+    assert_eq!(caps["promptCapabilities"]["image"], json!(false));
+    assert_eq!(caps["promptCapabilities"]["audio"], json!(false));
+    assert_eq!(caps["promptCapabilities"]["embeddedContext"], json!(false));
+    for capability in ["resume", "list", "close", "delete"] {
+        assert!(
+            caps["sessionCapabilities"][capability].is_object(),
+            "sessionCapabilities.{capability} should be advertised: {caps}"
+        );
+    }
+    assert_eq!(response["result"]["authMethods"], json!([]));
+
+    // -- session/new: locally minted id ---------------------------------------
+    let (_, response) = acp
+        .request("session/new", json!({"cwd": "/tmp", "mcpServers": []}))
+        .await;
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(session_id.starts_with("sess_"), "{session_id}");
+
+    // -- happy path: deltas stream, thinking gated, tools mapped, EndTurn -----
+    let (updates, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "happy"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let kinds: Vec<&str> = updates.iter().map(update_kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "agent_message_chunk",
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk",
+        ],
+        "unexpected update sequence: {updates:#?}"
+    );
+    assert_eq!(chunk_text(&updates[0]), "Hello");
+    assert_eq!(chunk_text(&updates[3]), " world");
+    assert_eq!(updates[1]["params"]["update"]["toolCallId"], "tc_1");
+    assert_eq!(updates[1]["params"]["update"]["status"], "in_progress");
+    assert_eq!(updates[2]["params"]["update"]["status"], "completed");
+    for update in &updates {
+        assert_eq!(
+            update["params"]["sessionId"].as_str().unwrap(),
+            session_id,
+            "update under wrong session id"
+        );
+    }
+
+    // -- upstream error event: JSON-RPC error, no stop reason ------------------
+    let (updates, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "error"}]
+            }),
+        )
+        .await;
+    assert_eq!(chunk_text(&updates[0]), "partial");
+    let error = &response["error"];
+    assert!(error.is_object(), "expected error response: {response}");
+    assert_eq!(error["message"], "kaboom");
+    assert_eq!(error["data"]["code"], "BRIDGE_UPSTREAM_ERROR");
+
+    // -- stream dies mid-turn: UnexpectedFailure-equivalent error --------------
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "truncate"}]
+            }),
+        )
+        .await;
+    assert_eq!(
+        response["error"]["data"]["code"], "BRIDGE_STREAM_TRUNCATED",
+        "response: {response}"
+    );
+
+    // -- non-text content is rejected (text-only v1) ---------------------------
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image", "data": "aGk=", "mimeType": "image/png"}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(
+        response["error"]["data"]["code"],
+        "BRIDGE_UNSUPPORTED_CONTENT"
+    );
+
+    // -- unknown session is rejected -------------------------------------------
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": "sess_doesnotexist",
+                "prompt": [{"type": "text", "text": "happy"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["error"]["data"]["code"], "BRIDGE_UNKNOWN_SESSION");
+
+    // -- cancellation: fire cancel_request, drop stream, resolve Cancelled -----
+    acp.next_id += 1;
+    let prompt_id = acp.next_id;
+    acp.send(json!({
+        "jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "hang"}]
+        }
+    }))
+    .await;
+    // Wait for the first delta so the turn is provably in flight.
+    let first = acp.read_message().await;
+    assert_eq!(update_kind(&first), "agent_message_chunk");
+    assert_eq!(chunk_text(&first), "started...");
+
+    acp.notify("session/cancel", json!({"sessionId": session_id}))
+        .await;
+    let (_, response) = acp.read_until_response(prompt_id).await;
+    assert_eq!(
+        response["result"]["stopReason"], "cancelled",
+        "response: {response}"
+    );
+
+    // The bridge must have fired DELETE /v1/requests/{request_id} upstream.
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        let cancelled = server.cancelled_request_ids.lock().unwrap().clone();
+        if !cancelled.is_empty() {
+            assert!(cancelled[0].starts_with("req_"), "{cancelled:?}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "bridge never called cancel_request upstream"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // -- session surface: list / resume / close --------------------------------
+    let (_, response) = acp.request("session/list", json!({})).await;
+    let sessions = response["result"]["sessions"].as_array().unwrap();
+    assert!(sessions
+        .iter()
+        .any(|s| s["sessionId"].as_str() == Some(session_id.as_str())));
+
+    let (_, response) = acp
+        .request(
+            "session/resume",
+            json!({"sessionId": "sess_fromapastlife", "cwd": "/tmp", "mcpServers": []}),
+        )
+        .await;
+    assert!(response["result"].is_object(), "{response}");
+
+    let (_, response) = acp
+        .request("session/close", json!({"sessionId": session_id}))
+        .await;
+    assert!(response["result"].is_object(), "{response}");
+    let (_, response) = acp.request("session/list", json!({})).await;
+    let sessions = response["result"]["sessions"].as_array().unwrap();
+    assert!(!sessions
+        .iter()
+        .any(|s| s["sessionId"].as_str() == Some(session_id.as_str())));
+
+    // -- southbound assertions --------------------------------------------------
+    {
+        let keys = server.seen_client_keys.lock().unwrap();
+        assert!(!keys.is_empty());
+        assert!(keys.iter().all(|key| key == "test-key-123"));
+
+        let payloads = server.chat_payloads.lock().unwrap();
+        for payload in payloads.iter() {
+            assert_eq!(payload["stream"], json!(true));
+            assert!(payload["request_id"].as_str().unwrap().starts_with("req_"));
+            assert!(payload["session_id"].as_str().unwrap().starts_with("sess_"));
+        }
+    }
+
+    // -- byte-level stdout discipline -------------------------------------------
+    for line in &acp.raw_stdout {
+        let value: Value = serde_json::from_str(line).expect("every stdout line must be JSON-RPC");
+        assert_eq!(
+            value["jsonrpc"], "2.0",
+            "non-JSON-RPC frame on stdout: {line}"
+        );
+    }
+}

@@ -4,11 +4,11 @@
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    ContentBlock, DeleteSessionRequest, DeleteSessionResponse, Error, InitializeRequest,
-    InitializeResponse, Implementation, ListSessionsRequest, ListSessionsResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
+    DeleteSessionRequest, DeleteSessionResponse, Error, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
     SessionDeleteCapabilities, SessionInfo, SessionListCapabilities, SessionNotification,
     SessionResumeCapabilities, StopReason,
 };
@@ -24,9 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::resolve_user_id;
 use crate::mux::chat_payload;
 use crate::session::{new_id, ActiveTurn, SessionRegistry, TurnError};
-use crate::translate::{
-    stream_end_outcome, Translator, TurnEvent, CODE_TRANSPORT_ERROR,
-};
+use crate::translate::{stream_end_outcome, Translator, TurnEvent, CODE_TRANSPORT_ERROR};
 
 /// Shared bridge state, cloned into every handler.
 pub struct BridgeState {
@@ -109,7 +107,9 @@ pub async fn run(state: Arc<BridgeState>) -> Result<(), Error> {
         .builder()
         .name("muxi-acp")
         .on_receive_request(
-            async move |request: InitializeRequest, responder: Responder<InitializeResponse>, _cx| {
+            async move |request: InitializeRequest,
+                        responder: Responder<InitializeResponse>,
+                        _cx| {
                 tracing::info!(
                     client = ?request.client_info.as_ref().map(|info| info.name.clone()),
                     "initialize"
@@ -123,7 +123,9 @@ pub async fn run(state: Arc<BridgeState>) -> Result<(), Error> {
             on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: NewSessionRequest, responder: Responder<NewSessionResponse>, _cx| {
+            async move |request: NewSessionRequest,
+                        responder: Responder<NewSessionResponse>,
+                        _cx| {
                 let session_id = st_new.sessions.create(request.cwd.clone());
                 tracing::info!(session_id, cwd = %request.cwd.display(), "session/new");
                 responder.respond(NewSessionResponse::new(session_id))
@@ -214,12 +216,10 @@ fn handle_prompt(
     let session_id = request.session_id.0.to_string();
 
     if !state.sessions.contains(&session_id) {
-        return responder.respond_with_error(
-            Error::invalid_params().data(json!({
-                "code": "BRIDGE_UNKNOWN_SESSION",
-                "sessionId": session_id,
-            })),
-        );
+        return responder.respond_with_error(Error::invalid_params().data(json!({
+            "code": "BRIDGE_UNKNOWN_SESSION",
+            "sessionId": session_id,
+        })));
     }
 
     // Text-only in v1: concatenate text blocks in order, reject the rest.

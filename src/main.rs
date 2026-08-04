@@ -54,7 +54,10 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(config::default_config_path);
     let state = match build_state(&cli, &config_path) {
         Ok(state) => state,
         Err(message) => {
@@ -76,11 +79,13 @@ async fn main() -> ExitCode {
 
 fn build_state(cli: &Cli, config_path: &Path) -> Result<Arc<agent::BridgeState>, String> {
     let file = config::load(config_path).map_err(|err| err.to_string())?;
-    let profile = config::select_profile(&file, cli.profile.as_deref())
-        .map_err(|err| err.to_string())?;
+    let profile =
+        config::select_profile(&file, cli.profile.as_deref()).map_err(|err| err.to_string())?;
     profile.validate_endpoint().map_err(|err| err.to_string())?;
 
-    let key_reference = profile.client_key_reference().map_err(|err| err.to_string())?;
+    let key_reference = profile
+        .client_key_reference()
+        .map_err(|err| err.to_string())?;
     let client_key = config::resolve_secret(key_reference).map_err(|err| err.to_string())?;
 
     let mux = mux::client_from_profile(&profile, &client_key).map_err(|err| err.to_string())?;
