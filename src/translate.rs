@@ -43,6 +43,9 @@ pub enum TurnEvent {
 pub struct Translator {
     forward_thoughts: bool,
     seen_tools: HashSet<String>,
+    /// Whether any assistant text was streamed as `content` deltas this turn.
+    /// Decides if a terminal `completed` frame's text is new or a duplicate.
+    streamed_content: bool,
 }
 
 impl Translator {
@@ -50,6 +53,7 @@ impl Translator {
         Self {
             forward_thoughts,
             seen_tools: HashSet::new(),
+            streamed_content: false,
         }
     }
 
@@ -78,7 +82,10 @@ impl Translator {
         // the item is either a raw text delta or an event object. Unwrap it;
         // frames that already carry a top-level `type` pass through unchanged.
         let obj = match json.get("token") {
-            Some(Value::String(text)) => return message_chunk(text),
+            Some(Value::String(text)) => {
+                self.streamed_content = true;
+                return message_chunk(text);
+            }
             Some(inner @ Value::Object(_)) => inner.clone(),
             Some(_) => return Vec::new(),
             None => json,
@@ -86,7 +93,10 @@ impl Translator {
 
         let event_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
         match event_type {
-            "content" => message_chunk(&event_text(&obj)),
+            "content" => {
+                self.streamed_content = true;
+                message_chunk(&event_text(&obj))
+            }
             "thinking" => {
                 // Gated off by default (spec §7): only forward when the
                 // operator opted in via `forward_thoughts`.
@@ -107,7 +117,22 @@ impl Translator {
             "tool_call" => self.translate_tool_call(&obj),
             // No general ACP progress channel; never fabricate content (§7).
             "progress" => Vec::new(),
-            "completed" => vec![TurnEvent::Completed],
+            "completed" => {
+                // The runtime does not stream `content` deltas for a plain
+                // turn: the full assistant text arrives HERE, in the terminal
+                // event's `content` field (verified against a live formation).
+                // Emit it as the final message chunk — unless deltas were
+                // already streamed, in which case it duplicates what the host
+                // has seen (PRD §15.2 dedup rule).
+                let text = event_text(&obj);
+                if !self.streamed_content && !text.is_empty() {
+                    let mut out = message_chunk(&text);
+                    out.push(TurnEvent::Completed);
+                    out
+                } else {
+                    vec![TurnEvent::Completed]
+                }
+            }
             "error" => vec![upstream_error(&obj)],
             _ => Vec::new(),
         }
@@ -367,9 +392,34 @@ mod tests {
     }
 
     #[test]
-    fn completed_is_terminal() {
+    fn completed_after_streamed_content_is_terminal_only() {
+        // Deltas were streamed, so the terminal text is a duplicate (§15.2).
         let mut t = Translator::new(false);
-        let out = t.translate(&frame(r#"{"type":"completed","content":"done"}"#));
+        t.translate(&frame(r#"{"type":"content","content":"Hello."}"#));
+        let out = t.translate(&frame(r#"{"type":"completed","content":"Hello."}"#));
+        assert_eq!(out, vec![TurnEvent::Completed]);
+    }
+
+    #[test]
+    fn completed_without_streamed_content_carries_the_reply() {
+        // A plain live turn: the runtime streams no content deltas — the full
+        // assistant text arrives only in the terminal `completed` frame.
+        let mut t = Translator::new(false);
+        t.translate(&frame(r#"{"type":"progress","content":"working"}"#));
+        t.translate(&frame(r#"{"type":"planning","content":"plan"}"#));
+        let out = t.translate(&frame(r#"{"type":"completed","content":"Hello."}"#));
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            TurnEvent::Update(update) => assert_eq!(text_of(update), "Hello."),
+            other => panic!("expected message chunk, got {other:?}"),
+        }
+        assert_eq!(out[1], TurnEvent::Completed);
+    }
+
+    #[test]
+    fn completed_with_empty_content_is_terminal_only() {
+        let mut t = Translator::new(false);
+        let out = t.translate(&frame(r#"{"type":"completed"}"#));
         assert_eq!(out, vec![TurnEvent::Completed]);
     }
 
