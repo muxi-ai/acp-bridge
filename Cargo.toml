@@ -19,7 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
-rand = "0.8"
+rand = "0.9"
 keyring = "4"
 
 [dev-dependencies]
