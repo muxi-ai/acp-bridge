@@ -22,6 +22,7 @@ use muxi_rust::FormationClient;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::buzz::HostIdentity;
 use crate::config::resolve_user_id;
 use crate::mux::chat_payload;
 use crate::session::{new_id, SessionRegistry, TurnError};
@@ -37,6 +38,9 @@ pub struct BridgeState {
     pub agent_id: Option<String>,
     pub cli_user_id: Option<String>,
     pub default_user_id: Option<String>,
+    /// Tier-2 host identity extraction (spec §5.2), e.g. Buzz prompt parsing.
+    /// `None` when `identity.host = "none"`.
+    pub host_extractor: Option<Box<dyn HostIdentity + Send + Sync>>,
     pub forward_thoughts: bool,
     /// Wall-clock cap for a whole prompt turn.
     pub turn_timeout: std::time::Duration,
@@ -46,9 +50,48 @@ pub struct BridgeState {
 }
 
 impl BridgeState {
+    /// Identity without prompt text (tiers 1/3/4 only): used by cancel and
+    /// shutdown paths, where no prompt is at hand. That is fine — the MUXI
+    /// cancel endpoint is keyed by `request_id`; the user id header on a
+    /// cancel is best-effort context, not a lookup key.
     pub(crate) fn user_id_for(&self, acp_session_id: &str) -> String {
         resolve_user_id(
             self.cli_user_id.as_deref(),
+            None,
+            self.default_user_id.as_deref(),
+            acp_session_id,
+        )
+    }
+
+    /// Full identity resolution for one prompt turn (spec §5.2): `--user-id`
+    /// flag > host extraction from *this turn's* prompt text >
+    /// `default_user_id` > per-session synthetic.
+    ///
+    /// Resolved per-turn, not per-session, because the identity signal lives
+    /// in each turn's prompt: in `sender` mode a Buzz channel session carries
+    /// turns from different people, so the same session's `user_id` may
+    /// legitimately vary between turns — attribution follows whoever sent the
+    /// message being answered, not whoever happened to open the session. In
+    /// `channel` mode the extracted id is stable for the session's lifetime.
+    pub(crate) fn user_id_for_turn(&self, acp_session_id: &str, prompt_text: &str) -> String {
+        // Tier 1 short-circuits extraction entirely: no point parsing (or
+        // warning about) prompt text the flag will override anyway.
+        let flag_set = self.cli_user_id.as_deref().is_some_and(|id| !id.is_empty());
+        let extracted = if flag_set {
+            None
+        } else {
+            self.host_extractor.as_ref().and_then(|extractor| {
+                extractor.extract(prompt_text).map(|identity| {
+                    for diagnostic in &identity.diagnostics {
+                        tracing::warn!(session_id = acp_session_id, "{diagnostic}");
+                    }
+                    identity.user_id
+                })
+            })
+        };
+        resolve_user_id(
+            self.cli_user_id.as_deref(),
+            extracted.as_deref(),
             self.default_user_id.as_deref(),
             acp_session_id,
         )
@@ -326,12 +369,17 @@ fn handle_prompt(
 
     tracing::info!(session_id, request_id, bytes = text.len(), "session/prompt");
 
+    // Identity is resolved here, per-turn, from this turn's prompt text —
+    // see `user_id_for_turn` for why it cannot be a session-level constant.
+    let user_id = state.user_id_for_turn(&session_id, &text);
+
     let turn = run_turn(
         state.clone(),
         cx.clone(),
         responder,
         session_id,
         request_id,
+        user_id,
         cancel,
         text,
     );
@@ -361,16 +409,17 @@ fn content_block_kind(block: &ContentBlock) -> &'static str {
 ///   never dropped while the turn reports success.
 /// - A host disconnect (stdin EOF) abandons the turn without responding; the
 ///   shutdown path in `main` fires the upstream cancels.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     state: Arc<BridgeState>,
     cx: ConnectionTo<Client>,
     responder: Responder<PromptResponse>,
     session_id: String,
     request_id: String,
+    user_id: String,
     cancel: CancellationToken,
     text: String,
 ) -> Result<(), Error> {
-    let user_id = state.user_id_for(&session_id);
     let payload = chat_payload(&text, &session_id, &request_id, state.agent_id.as_deref());
     let mux = state.mux.clone();
     let mut translator = Translator::new(state.forward_thoughts);
