@@ -1,5 +1,7 @@
 # muxi-acp
 
+[![CI](https://github.com/muxi-ai/acp-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/muxi-ai/acp-bridge/actions/workflows/ci.yml)
+
 > **Status: WIP** — proof of concept. Nothing here is stable, supported, or
 > safe to depend on yet.
 
