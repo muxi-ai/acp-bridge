@@ -507,3 +507,144 @@ mod tests {
         }
     }
 }
+
+/// Property tests: the translator is the trust boundary for upstream bytes,
+/// so it must hold its invariants for *arbitrary* frame data, not just the
+/// fixtures above. Case counts are kept CI-friendly (256–512 per property).
+#[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn frame(event: &str, data: &str) -> SseEvent {
+        SseEvent {
+            event: event.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    /// `TurnEvent::Error` can only ever be produced from a frame that itself
+    /// carries "error" (as the SSE event name or a `type` field). If the
+    /// input contains no "error" substring at all, no Error may come out —
+    /// a sound over-approximation that needs no re-parsing in the test.
+    fn assert_no_fabricated_error(events: &[TurnEvent], event: &str, data: &str) {
+        if event != "error" && !data.contains("error") {
+            assert!(
+                events.iter().all(|e| !matches!(e, TurnEvent::Error { .. })),
+                "fabricated Error from event={event:?} data={data:?}: {events:?}"
+            );
+        }
+    }
+
+    /// Arbitrary JSON values, deep enough to hit the token-unwrap and every
+    /// typed branch.
+    fn arb_json() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|n| json!(n)),
+            ".*".prop_map(Value::String),
+            // Weight the field names the translator actually looks at, so the
+            // generator reaches the interesting branches often.
+            prop_oneof![
+                Just("content"),
+                Just("thinking"),
+                Just("tool_call"),
+                Just("completed"),
+                Just("planning"),
+                Just("done"),
+                Just("token"),
+                Just("error")
+            ]
+            .prop_map(|s| Value::String(s.to_string())),
+        ];
+        leaf.prop_recursive(3, 24, 6, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::vec(
+                    (
+                        prop_oneof![
+                            Just("type".to_string()),
+                            Just("token".to_string()),
+                            Just("content".to_string()),
+                            Just("status".to_string()),
+                            Just("tool_call_id".to_string()),
+                            Just("error".to_string()),
+                            ".*".prop_map(String::from),
+                        ],
+                        inner
+                    ),
+                    0..6
+                )
+                .prop_map(|pairs| Value::Object(pairs.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Wholly arbitrary event names and frame data: never panic, always
+        /// yield a Vec (possibly empty), never fabricate an Error.
+        #[test]
+        fn arbitrary_text_frames_never_panic_or_fabricate_errors(
+            event in prop_oneof![
+                Just("message".to_string()),
+                Just("done".to_string()),
+                Just("ui".to_string()),
+                Just("error".to_string()),
+                ".*",
+            ],
+            data in ".*",
+            forward_thoughts in any::<bool>(),
+        ) {
+            let mut translator = Translator::new(forward_thoughts);
+            let events = translator.translate(&frame(&event, &data));
+            assert_no_fabricated_error(&events, &event, &data);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(384))]
+
+        /// Structured-but-arbitrary JSON exercises every typed branch without
+        /// panicking, including sequences of frames against one translator
+        /// (the only cross-frame state is tool first-sighting and the
+        /// streamed-content flag).
+        #[test]
+        fn arbitrary_json_frame_sequences_never_panic(
+            values in prop::collection::vec(arb_json(), 1..5),
+            forward_thoughts in any::<bool>(),
+        ) {
+            let mut translator = Translator::new(forward_thoughts);
+            for value in &values {
+                let data = value.to_string();
+                let events = translator.translate(&frame("message", &data));
+                assert_no_fabricated_error(&events, "message", &data);
+            }
+        }
+
+        /// Truncating a valid frame at any char boundary (mid-token, mid-
+        /// string, mid-escape) must never panic and never fabricate an Error
+        /// — a torn frame is ignored, exactly like any other non-JSON data.
+        /// (SSE data is always a valid-UTF-8 `String` by the SDK's contract,
+        /// so char boundaries are the finest slicing the type system allows.)
+        #[test]
+        fn truncated_json_never_panics_and_never_errors(
+            value in arb_json(),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let data = value.to_string();
+            let mut end = cut.index(data.len() + 1);
+            while end < data.len() && !data.is_char_boundary(end) {
+                end += 1;
+            }
+            let truncated = &data[..end];
+            let mut translator = Translator::new(true);
+            let events = translator.translate(&frame("message", truncated));
+            assert_no_fabricated_error(&events, "message", truncated);
+        }
+    }
+}

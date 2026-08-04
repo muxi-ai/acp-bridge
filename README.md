@@ -24,6 +24,30 @@ config format, ACP↔MUXI method/event mappings, identity resolution).
 all logging goes to stderr (`tracing`, controlled by `RUST_LOG`). The
 integration test enforces this at the byte level.
 
+## Logging & redaction
+
+At the default log levels (`info`/`warn`/`error`), stderr never carries
+conversation content or credentials — only session/request ids, stable
+diagnostic codes, and byte lengths:
+
+- Prompt and response text are never logged (prompts log `bytes = <len>`).
+- Upstream error messages are content-bearing (formations echo model/tool
+  text into them): WARN logs the code and message length; the full text goes
+  to the host in the JSON-RPC error, and to stderr only at `debug`.
+- Transport failures log the fact at WARN and the error detail at `debug`
+  (SDK errors can quote raw SSE frame data).
+- Buzz parse-miss diagnostics describe the failure structurally and never
+  quote prompt lines.
+- Resolved user ids are sent upstream as headers, not logged; client keys are
+  never logged (`doctor` prints only the reference *scheme*).
+- The ACP SDK (`agent_client_protocol`) logs full JSON-RPC error objects at
+  WARN, so the bridge caps that crate at `error` unless you name it in
+  `RUST_LOG` yourself (e.g. `RUST_LOG=info,agent_client_protocol=debug`).
+
+The e2e suite enforces this: a run at `RUST_LOG=info` plants canary strings
+in the prompt, the response, and an upstream error message, then asserts none
+of them (nor the client key) appear on stderr.
+
 ## Quickstart
 
 ### 1. Config
@@ -41,7 +65,13 @@ formation  = "operations-hero"
 # ... or a direct formation runtime instead:
 # base_url = "http://127.0.0.1:5050/v1"
 
-# Secret *reference*, never a literal. Schemes: env: | file: | keychain: (stub)
+# Secret *reference*, never a literal. Schemes:
+#   env:NAME                        environment variable
+#   file:/path                      file contents (trimmed)
+#   keychain:<service>/<account>    OS keychain (macOS Keychain, Windows
+#                                   Credential Manager, Linux Secret Service);
+#                                   split on the FIRST slash — the account may
+#                                   itself contain slashes
 client_key = "env:MUXI_CLIENT_KEY"
 
 # Optional: pin a specific agent; empty/absent lets the overlord route.
@@ -113,9 +143,10 @@ cargo test --test e2e -- --nocapture
 Fixtures cover: content deltas → ui → done, an upstream error event, a
 stream that dies mid-turn, a hanging stream interrupted by
 `session/cancel`, idle/turn timeouts, a firehose that overflows the
-northbound buffer cap, stdin EOF cancelling an in-flight turn, and a
+northbound buffer cap, stdin EOF cancelling an in-flight turn, a
 Buzz-shaped prompt whose extracted channel identity must reach the server
-as `X-Muxi-User-ID`.
+as `X-Muxi-User-ID`, and a redaction sweep asserting that canary strings in
+the prompt/response/error text never reach stderr at `RUST_LOG=info`.
 
 ## CLI
 
@@ -176,7 +207,7 @@ synthetic `acp:<session_id>`.
 | Graceful shutdown | ✅ stdin EOF or SIGTERM/SIGINT: stop accepting requests, cancel all active MUXI turns (bounded 5s window), flush stdout, exit 0 |
 | Session persistence | ❌ in-memory only; dies with the process. `session/resume` still works across restarts because the bridge owns the id space, but MUXI-side context depends on the formation's buffer. |
 | Buzz identity extraction | ✅ prompt-text parser (`src/buzz.rs`): `channel` (default) / `sender` units, strict validation, soft-fail to `default_user_id` / per-session id, multi-sender + header-count diagnostics. `_meta`-based extraction stays pending the upstream `buzz-acp` proposal |
-| `keychain:` secret references | ❌ stub — returns "not yet implemented"; use `env:` or `file:` |
+| `keychain:` secret references | ✅ `keychain:<service>/<account>` via the `keyring` crate: macOS Keychain, Windows Credential Manager, Linux Secret Service (pure-Rust zbus D-Bus client — no OpenSSL, needs GNOME Keyring / KWallet running). Errors distinguish "entry not found" from "access denied / store unavailable" and never echo the value |
 | `session/load` (history replay) | ❌ deliberately not advertised (MUXI's history endpoint can't honor it honestly) |
 | UI widgets → `elicitation` | ❌ v2 idea; the text stream always carries the fallback |
 | Static builds / rustls | ❌ `muxi-rust`'s reqwest default features pull native-tls (OpenSSL/Security.framework), which blocks a fully static binary; the planned fix is a small SDK PR switching to `rustls-tls` |
@@ -185,6 +216,18 @@ synthetic `acp:<session_id>`.
 
 ```sh
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+Unit tests include property tests (`proptest`, 256–512 cases per property)
+over the SSE translator, the Buzz extractor, and the stdout-writer's JSON-RPC
+line parser: arbitrary/truncated input never panics, never fabricates an
+error event, and never yields a malformed identity.
+
+The keychain tests that touch the real OS keychain are gated off in CI
+(headless runners have no keychain/Secret Service). Run them locally with:
+
+```sh
+MUXI_ACP_KEYCHAIN_TESTS=1 cargo test keychain_live
 ```
 
 ## License

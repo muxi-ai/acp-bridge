@@ -66,12 +66,26 @@ const SHUTDOWN_CANCEL_WINDOW: std::time::Duration = std::time::Duration::from_se
 #[tokio::main]
 async fn main() -> ExitCode {
     // stderr only — stdout is reserved for ACP protocol frames.
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Redaction (README "Logging & redaction"): the ACP SDK logs full JSON-RPC
+    // error objects at WARN — and a prompt turn's error message can embed
+    // model/tool text. Cap the SDK crate at ERROR (its error-level logs carry
+    // only serde/transport diagnostics) unless the operator explicitly named
+    // it in RUST_LOG (e.g. RUST_LOG=info,agent_client_protocol=debug).
+    let sdk_named_in_rust_log = std::env::var("RUST_LOG")
+        .map(|value| value.contains("agent_client_protocol"))
+        .unwrap_or(false);
+    if !sdk_named_in_rust_log {
+        filter = filter.add_directive(
+            "agent_client_protocol=error"
+                .parse()
+                .expect("static directive parses"),
+        );
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
         .init();
 
     let cli = Cli::parse();

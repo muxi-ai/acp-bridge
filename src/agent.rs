@@ -499,7 +499,13 @@ async fn run_turn(
                     break 'turn;
                 }
                 Some(Err(err)) => {
-                    tracing::warn!(session_id, request_id, error = %err, "transport failure mid-turn");
+                    // Redaction: transport errors can embed raw SSE frame data
+                    // (e.g. parse failures quoting the payload). WARN carries
+                    // the fact; the detail goes to debug. The host still gets
+                    // the full message in the JSON-RPC error (protocol, not a
+                    // log).
+                    tracing::warn!(session_id, request_id, "transport failure mid-turn");
+                    tracing::debug!(session_id, request_id, error = %err, "transport failure detail");
                     if let Some(responder) = responder.take() {
                         finish(responder.respond_with_error(
                             bridge_error(CODE_TRANSPORT_ERROR, &err.to_string()),
@@ -558,7 +564,13 @@ async fn run_turn(
                                 break 'turn;
                             }
                             TurnEvent::Error { code, message } => {
-                                tracing::warn!(session_id, request_id, code, message, "upstream error");
+                                // Redaction: the upstream message is content-
+                                // bearing (formations echo model/tool text
+                                // into error messages). WARN logs code +
+                                // length; the text goes to debug and, as
+                                // protocol, into the JSON-RPC error below.
+                                tracing::warn!(session_id, request_id, code, message_bytes = message.len(), "upstream error");
+                                tracing::debug!(session_id, request_id, code, message, "upstream error detail");
                                 if let Some(responder) = responder.take() {
                                     finish(responder.respond_with_error(bridge_error(&code, &message)));
                                 }
@@ -582,5 +594,58 @@ async fn run_turn(
 fn finish(result: Result<(), Error>) {
     if let Err(err) = result {
         tracing::warn!(error = ?err, "failed to deliver terminal prompt result");
+    }
+}
+
+/// Property tests for `note_line_written` — the JSON-RPC line parser on the
+/// stdout-writer hot path. It sees every outbound line and must never panic,
+/// whatever the framing layer hands it. (256–512 cases: CI-friendly.)
+#[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::config::Limits;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Arbitrary lines: not JSON, half JSON, wrong shapes — never panic.
+        #[test]
+        fn note_line_written_never_panics_on_arbitrary_lines(line in ".*") {
+            let sessions = SessionRegistry::new(Limits::default());
+            note_line_written(&sessions, &line);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// session/update-shaped lines with arbitrary session ids (unknown to
+        /// the registry, weird unicode, empty) — never panic, including when
+        /// sessionId is a non-string or params are missing.
+        #[test]
+        fn note_line_written_never_panics_on_update_shaped_lines(
+            session_id in ".*",
+            params_are_valid in any::<bool>(),
+        ) {
+            let sessions = SessionRegistry::new(Limits::default());
+            let line = if params_are_valid {
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sessionId": session_id, "update": {}}
+                })
+                .to_string()
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sessionId": 42}
+                })
+                .to_string()
+            };
+            note_line_written(&sessions, &line);
+        }
     }
 }
