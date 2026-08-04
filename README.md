@@ -50,6 +50,19 @@ agent = ""
 # Forward `thinking` events as agent_thought_chunk (off by default).
 forward_thoughts = false
 
+# Reliability posture (humantime strings; defaults shown).
+turn_timeout = "30m"   # wall-clock cap per prompt turn
+idle_timeout = "10m"   # cap on silence between SSE frames
+
+# Plaintext endpoints (http:// or ws://) are rejected at startup unless the
+# host is loopback AND this is set. Off-box traffic is always TLS.
+allow_insecure_localhost = false
+
+[profiles.production.limits]
+max_sessions         = 8        # session/new beyond this -> BRIDGE_SESSION_LIMIT
+max_concurrent_turns = 4        # prompts beyond this -> BRIDGE_TURN_LIMIT (never queued)
+max_buffered_bytes   = 1048576  # per-turn cap on updates queued but unwritten
+
 [profiles.production.identity]
 # Used when no --user-id flag is given; if both are unset, each session
 # gets a synthetic partition id `acp:<session_id>`.
@@ -86,8 +99,9 @@ cargo test --test e2e -- --nocapture
 ```
 
 Fixtures cover: content deltas → ui → done, an upstream error event, a
-stream that dies mid-turn, and a hanging stream interrupted by
-`session/cancel`.
+stream that dies mid-turn, a hanging stream interrupted by
+`session/cancel`, idle/turn timeouts, a firehose that overflows the
+northbound buffer cap, and stdin EOF cancelling an in-flight turn.
 
 ## CLI
 
@@ -112,6 +126,11 @@ per-session synthetic `acp:<session_id>`.
 | Event mapping | ✅ content / planning / replanning / tool_call (first-sighting) / completed / done; `thinking` gated behind `forward_thoughts`; `progress` and `ui` dropped in v1 |
 | Stop reasons | ✅ `end_turn` / `cancelled` only; failures are JSON-RPC errors with stable `data.code` diagnostics — `MaxTokens`/`MaxTurnRequests`/`Refusal` are never emitted |
 | Retries | ✅ never for prompts (deliberate: a retried prompt re-runs the whole turn server-side) |
+| Turn / idle timeouts | ✅ `turn_timeout` (30m) bounds the whole turn, `idle_timeout` (10m) bounds silence between SSE frames; expiry cancels upstream and fails the turn (`BRIDGE_TURN_TIMEOUT` / `BRIDGE_IDLE_TIMEOUT`) |
+| Bounded northbound buffering | ✅ per-turn `limits.max_buffered_bytes` (1 MiB) on updates queued but not yet written to stdout; overflow cancels upstream and fails the turn (`BRIDGE_BUFFER_OVERFLOW`) — updates are never silently dropped |
+| Concurrency caps | ✅ `limits.max_sessions` (8) and `limits.max_concurrent_turns` (4); over-cap requests are rejected (`BRIDGE_SESSION_LIMIT` / `BRIDGE_TURN_LIMIT`), never queued — the ACP host owns queuing |
+| TLS enforcement | ✅ plaintext (`http://` / `ws://`) endpoints rejected at startup unless loopback + `allow_insecure_localhost = true`; error names the offending profile key |
+| Graceful shutdown | ✅ stdin EOF or SIGTERM/SIGINT: stop accepting requests, cancel all active MUXI turns (bounded 5s window), flush stdout, exit 0 |
 | Session persistence | ❌ in-memory only; dies with the process. `session/resume` still works across restarts because the bridge owns the id space, but MUXI-side context depends on the formation's buffer. |
 | Buzz identity extraction (`_meta` / prompt-text parsing) | ❌ stub only (`src/buzz.rs`); tiers 1/3/4 of identity resolution work today |
 | `keychain:` secret references | ❌ stub — returns "not yet implemented"; use `env:` or `file:` |

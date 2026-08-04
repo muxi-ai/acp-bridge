@@ -137,6 +137,43 @@ async fn chat_handler(
                 json!({"finished": true})
             )],
         ),
+        // a frame every 100ms, indefinitely-ish: total wall time far exceeds
+        // any small turn_timeout while each gap stays under idle_timeout
+        "trickle" => {
+            let frames: Vec<String> = (0..200)
+                .map(|i| {
+                    data_frame(stamp(
+                        json!({"type": "content", "content": format!("t{i} ")}),
+                    ))
+                })
+                .collect();
+            let stream = futures::stream::unfold(VecDeque::from(frames), |mut frames| async move {
+                let frame = frames.pop_front()?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Some((Ok::<_, std::convert::Infallible>(frame), frames))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        // ~750 KiB of content frames as fast as the socket allows, then hang:
+        // with a tiny max_buffered_bytes and a host that stops reading, the
+        // bridge's northbound queue must overflow, not grow without bound
+        "firehose" => {
+            let blob = "x".repeat(200);
+            let frames: Vec<String> = (0..3000)
+                .map(|_| data_frame(stamp(json!({"type": "content", "content": blob}))))
+                .collect();
+            sse_response_with_hang(
+                frames,
+                vec![format!(
+                    "event: done\ndata: {}\n\n",
+                    json!({"finished": true})
+                )],
+            )
+        }
         other => panic!("fake server: unknown scenario '{other}'"),
     }
 }
@@ -176,8 +213,8 @@ async fn start_fake_server() -> (SocketAddr, Arc<ServerState>) {
 // ---------------------------------------------------------------------------
 
 struct AcpChild {
-    _child: Child,
-    stdin: ChildStdin,
+    child: Child,
+    stdin: Option<ChildStdin>,
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
     /// Every raw stdout line, for byte-level discipline assertions.
     raw_stdout: Vec<String>,
@@ -186,6 +223,16 @@ struct AcpChild {
 
 impl AcpChild {
     async fn spawn(addr: SocketAddr, config_dir: &std::path::Path) -> Self {
+        Self::spawn_with_config(addr, config_dir, "").await
+    }
+
+    /// `extra_config` is appended inside `[profiles.test]` (put nested tables
+    /// like `[profiles.test.limits]` at the end of the string).
+    async fn spawn_with_config(
+        addr: SocketAddr,
+        config_dir: &std::path::Path,
+        extra_config: &str,
+    ) -> Self {
         let config_path = config_dir.join("config.toml");
         std::fs::write(
             &config_path,
@@ -196,6 +243,9 @@ default_profile = "test"
 [profiles.test]
 base_url = "http://{addr}/v1"
 client_key = "env:MUXI_ACP_TEST_KEY"
+# The fake server is plaintext loopback; TLS enforcement requires the opt-in.
+allow_insecure_localhost = true
+{extra_config}
 "#
             ),
         )
@@ -216,8 +266,8 @@ client_key = "env:MUXI_ACP_TEST_KEY"
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
         Self {
-            _child: child,
-            stdin,
+            child,
+            stdin: Some(stdin),
             stdout,
             raw_stdout: Vec::new(),
             next_id: 0,
@@ -225,10 +275,16 @@ client_key = "env:MUXI_ACP_TEST_KEY"
     }
 
     async fn send(&mut self, message: Value) {
+        let stdin = self.stdin.as_mut().expect("stdin already closed");
         let mut line = message.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await.unwrap();
-        self.stdin.flush().await.unwrap();
+        stdin.write_all(line.as_bytes()).await.unwrap();
+        stdin.flush().await.unwrap();
+    }
+
+    /// Close the bridge's stdin (host disconnect). Graceful-shutdown trigger.
+    fn close_stdin(&mut self) {
+        self.stdin.take();
     }
 
     async fn read_message(&mut self) -> Value {
@@ -271,6 +327,41 @@ client_key = "env:MUXI_ACP_TEST_KEY"
     async fn notify(&mut self, method: &str, params: Value) {
         self.send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .await;
+    }
+}
+
+/// initialize + session/new, returning the minted session id.
+async fn establish_session(acp: &mut AcpChild) -> String {
+    let (_, response) = acp
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientInfo": {"name": "e2e", "version": "0"}}),
+        )
+        .await;
+    assert!(response["result"].is_object(), "{response}");
+    let (_, response) = acp
+        .request("session/new", json!({"cwd": "/tmp", "mcpServers": []}))
+        .await;
+    response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Wait until the fake server has seen at least one DELETE /v1/requests/{id}.
+async fn expect_upstream_cancel(server: &Arc<ServerState>) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        let cancelled = server.cancelled_request_ids.lock().unwrap().clone();
+        if !cancelled.is_empty() {
+            assert!(cancelled[0].starts_with("req_"), "{cancelled:?}");
+            return cancelled;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "bridge never called cancel_request upstream"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -447,19 +538,7 @@ async fn bridge_end_to_end() {
     );
 
     // The bridge must have fired DELETE /v1/requests/{request_id} upstream.
-    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
-    loop {
-        let cancelled = server.cancelled_request_ids.lock().unwrap().clone();
-        if !cancelled.is_empty() {
-            assert!(cancelled[0].starts_with("req_"), "{cancelled:?}");
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "bridge never called cancel_request upstream"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    expect_upstream_cancel(&server).await;
 
     // -- session surface: list / resume / close --------------------------------
     let (_, response) = acp.request("session/list", json!({})).await;
@@ -508,4 +587,184 @@ async fn bridge_end_to_end() {
             "non-JSON-RPC frame on stdout: {line}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reliability posture: timeouts, backpressure, graceful shutdown
+// ---------------------------------------------------------------------------
+
+/// A stream that goes silent mid-turn must fail with BRIDGE_IDLE_TIMEOUT and
+/// cancel the MUXI request — not sit on the connection forever.
+#[tokio::test]
+async fn idle_timeout_fires_and_cancels_upstream() {
+    let (addr, server) = start_fake_server().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut acp = AcpChild::spawn_with_config(
+        addr,
+        config_dir.path(),
+        r#"
+idle_timeout = "300ms"
+turn_timeout = "30s"
+"#,
+    )
+    .await;
+    let session_id = establish_session(&mut acp).await;
+
+    // "hang": one delta, then 30s of silence — far beyond idle_timeout.
+    let (updates, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "hang"}]
+            }),
+        )
+        .await;
+    assert_eq!(chunk_text(&updates[0]), "started...");
+    assert_eq!(
+        response["error"]["data"]["code"], "BRIDGE_IDLE_TIMEOUT",
+        "response: {response}"
+    );
+
+    expect_upstream_cancel(&server).await;
+
+    // The turn slot is free again: a new prompt is accepted (and times out
+    // the same way, proving the state machine reset rather than wedged).
+    let (_, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "hang"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["error"]["data"]["code"], "BRIDGE_IDLE_TIMEOUT");
+}
+
+/// A stream that keeps trickling frames (never idle) must still be bounded by
+/// the overall turn_timeout.
+#[tokio::test]
+async fn turn_timeout_fires_and_cancels_upstream() {
+    let (addr, server) = start_fake_server().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut acp = AcpChild::spawn_with_config(
+        addr,
+        config_dir.path(),
+        r#"
+turn_timeout = "500ms"
+idle_timeout = "30s"
+"#,
+    )
+    .await;
+    let session_id = establish_session(&mut acp).await;
+
+    // "trickle": a frame every 100ms for 20s — each gap is well under
+    // idle_timeout, so only the turn deadline can end this.
+    let (updates, response) = acp
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "trickle"}]
+            }),
+        )
+        .await;
+    assert!(
+        !updates.is_empty(),
+        "expected some deltas before the deadline"
+    );
+    assert_eq!(
+        response["error"]["data"]["code"], "BRIDGE_TURN_TIMEOUT",
+        "response: {response}"
+    );
+
+    expect_upstream_cancel(&server).await;
+}
+
+/// A host that stops draining stdout must not make the bridge buffer without
+/// bound: past max_buffered_bytes the turn fails with BRIDGE_BUFFER_OVERFLOW
+/// and the MUXI request is cancelled. No update is silently dropped from a
+/// turn that reports success (PRD §15.3).
+#[tokio::test]
+async fn buffer_overflow_fails_the_turn_and_cancels_upstream() {
+    let (addr, server) = start_fake_server().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut acp = AcpChild::spawn_with_config(
+        addr,
+        config_dir.path(),
+        r#"
+[profiles.test.limits]
+max_buffered_bytes = 4096
+"#,
+    )
+    .await;
+    let session_id = establish_session(&mut acp).await;
+
+    // Fire the prompt but do NOT read stdout: the OS pipe fills, the writer
+    // blocks, and the bridge's northbound queue starts growing.
+    acp.next_id += 1;
+    let prompt_id = acp.next_id;
+    acp.send(json!({
+        "jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "firehose"}]
+        }
+    }))
+    .await;
+
+    // The overflow must be detected while the host is not reading.
+    expect_upstream_cancel(&server).await;
+
+    // Now drain: whatever was queued within the cap arrives, then the error.
+    let (updates, response) = acp.read_until_response(prompt_id).await;
+    assert!(
+        !updates.is_empty(),
+        "expected buffered deltas before the failure"
+    );
+    assert_eq!(
+        response["error"]["data"]["code"], "BRIDGE_BUFFER_OVERFLOW",
+        "response: {response}"
+    );
+}
+
+/// Closing the bridge's stdin mid-turn (host went away) must cancel the MUXI
+/// request upstream, flush, and exit 0 within the bounded shutdown window —
+/// never leave a formation running a turn for a dead host (PRD §21).
+#[tokio::test]
+async fn stdin_eof_cancels_active_turn_and_exits_cleanly() {
+    let (addr, server) = start_fake_server().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut acp = AcpChild::spawn(addr, config_dir.path()).await;
+    let session_id = establish_session(&mut acp).await;
+
+    // Start a turn against the hanging fixture and wait until it is provably
+    // in flight (first delta observed).
+    acp.next_id += 1;
+    let prompt_id = acp.next_id;
+    acp.send(json!({
+        "jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "hang"}]
+        }
+    }))
+    .await;
+    let first = acp.read_message().await;
+    assert_eq!(update_kind(&first), "agent_message_chunk");
+    assert_eq!(chunk_text(&first), "started...");
+
+    // Host disconnect.
+    acp.close_stdin();
+
+    // The bridge must fire DELETE /v1/requests/{id} upstream...
+    expect_upstream_cancel(&server).await;
+
+    // ...and exit 0 within the 5s cancel window (plus slack).
+    let status = timeout(Duration::from_secs(10), acp.child.wait())
+        .await
+        .expect("bridge did not exit after stdin EOF")
+        .expect("wait failed");
+    assert!(status.success(), "expected exit 0, got {status:?}");
 }
