@@ -440,8 +440,11 @@ async fn collect(
 
     // Identity used for the authenticated probes mirrors connect-time
     // resolution with a synthetic per-session tail.
+    // No prompt text exists in doctor mode, so the host-extraction tier
+    // (tier 2) never applies here — probe identity is flag > default > tail.
     let user_id = config::resolve_user_id(
         cli_user_id,
+        None,
         profile.identity.default_user_id.as_deref(),
         "doctor",
     );
