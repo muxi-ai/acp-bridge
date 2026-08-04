@@ -1,0 +1,25 @@
+[package]
+name = "muxi-acp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ACP <-> MUXI bridge: presents a remote MUXI formation as an Agent Client Protocol agent"
+repository = "https://github.com/muxi-ai/acp-bridge"
+
+[dependencies]
+agent-client-protocol = "2"
+muxi-rust = "1.20260713.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+rand = "0.8"
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
