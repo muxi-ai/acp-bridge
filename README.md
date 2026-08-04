@@ -119,12 +119,40 @@ as `X-Muxi-User-ID`.
 
 ## CLI
 
+Running with no subcommand starts ACP/connect mode on stdio.
+
 | Flag | Meaning |
 |---|---|
 | `--config <path>` | Config file (also `MUXI_ACP_CONFIG`) |
 | `--profile <name>` | Profile to use (also `MUXI_ACP_PROFILE`); defaults to `default_profile` |
 | `--user-id <id>` | Pin every session to this MUXI memory partition |
 | `--forward-thoughts` | Forward `thinking` events as `agent_thought_chunk` |
+
+### `doctor`
+
+```sh
+muxi-acp doctor [--profile NAME] [--json]
+```
+
+Validates production dependencies without creating a billable model turn.
+Each check reports PASS/WARN/FAIL/SKIP with a one-line detail, and the run
+continues past failures:
+
+| Check | What it proves |
+|---|---|
+| `config` | Profile loads; client key *reference* resolves (only the `env:`/`file:`/`keychain:` scheme is ever printed) |
+| `tls-policy` | Endpoint scheme passes the same TLS enforcement as connect |
+| `dns` | Endpoint host resolves |
+| `tcp+tls` | TCP connect + an HTTP(S) round-trip; for `https://` a completed round-trip is the TLS evidence |
+| `auth` | `GET /v1/sessions` with the client key — 2xx = accepted, 401 = bad credentials |
+| `streaming` | Transport only: the SSE endpoint shares the verified origin. Stream *mechanics* are only exercised by a real (billable) turn, which doctor never starts |
+| `cancellation` | `DELETE /v1/requests/<nonexistent>` — 404 = route present (expected); 400/405 = older runtime (WARN, degraded) |
+| `identity` | Which identity tier is active: flag / profile default / per-session (informational) |
+
+Exit 0 when nothing failed (warnings allowed — the summary notes them),
+1 when any check failed. `--json` emits a machine-readable array of
+`{check, status, detail}` on stdout. Doctor is not ACP mode, so its report
+goes to stdout; the JSON-RPC-only rule applies to connect mode.
 
 Identity precedence: `--user-id` → host extraction (`identity.host`, per
 turn from the prompt text) → `identity.default_user_id` → per-session
