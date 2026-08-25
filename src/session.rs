@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use rand::Rng;
+use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Limits;
